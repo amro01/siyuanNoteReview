@@ -126,10 +126,9 @@ def _set_hidden_cell_borders(cell):
 
 
 def _create_hidden_question_cell(doc):
-    """创建一个包裹单道题目的无边框表格单元格（允许跨页断行）"""
+    """创建一个包裹单道题目的无边框表格单元格"""
     table = doc.add_table(rows=1, cols=1)
     _set_no_border(table)
-    table.rows[0].allow_break_across_pages = True
     cell = table.cell(0, 0)
     _set_hidden_cell_borders(cell)
     return cell
@@ -229,11 +228,10 @@ def is_compact_item(item):
 
 def _write_item_to_cell(cell_or_doc, item, idx, is_dual=False):
     """
-    将一道题目写入文档或双栏表格单元格。
-    - 如果 cell_or_doc 是 Document（通栏模式）：直接向文档添加段落，不用表格包裹，允许自然跨页。
-    - 如果 cell_or_doc 是 Cell（双栏模式）：向已有单元格添加段落，保持 keep_with_next 以防止双栏内容跨页错乱。
+    将一道题目写入全宽表格单元格或文档（通用逻辑）。
+    cell_or_doc: 可以是 _create_hidden_question_cell 返回的 cell，也可以是 doc 本身。
     idx: 题号（用于显示）
-    is_dual: 如果 True，图片宽度限制为 Cm(7.2) 以防双栏溢出。
+    is_dual: 如果 True，图片宽度限制为 Cm(8.0) 以防双栏溢出。
     """
     doc_id, full_title, cat, score, text, images, answer_md = item
     display_title = format_question_title(full_title)
@@ -243,68 +241,29 @@ def _write_item_to_cell(cell_or_doc, item, idx, is_dual=False):
     is_cell = hasattr(cell_or_doc, 'add_table') is False  # 文档有 add_table，cell 没有
 
     if is_cell:
-        # ======== 双栏模式：写入已有 Table Cell ========
+        # cell 模式：已有 table/cell 包装，直接用
         cell = cell_or_doc
         cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
         cell_paragraphs = cell.paragraphs
         cell_paragraphs[0].clear()
-        # 大题标题 —— 保留 keep_with_next，确保序号不孤立（双栏缩小字号）
+        # 大题标题
         h = cell_paragraphs[0]
         h.alignment = WD_ALIGN_PARAGRAPH.LEFT
         h.paragraph_format.space_before = Pt(0)
-        h.paragraph_format.space_after = Pt(2)
         h.paragraph_format.keep_with_next = True
         run_h = h.add_run(f"{idx}. {display_title}")
         run_h.bold = True
         run_h.font.size = Pt(14)
         run_h.font.name = "微软雅黑"
         run_h._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
-
-        # 题目文本（不设 keep_with_next，允许自然跨页）
-        if text:
-            p = cell.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            p.paragraph_format.space_before = Pt(6)
-            p.paragraph_format.space_after = Pt(2)
-            rt = p.add_run(text)
-            rt.font.size = Pt(12)
-            rt.font.name = "宋体"
-            rt._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-
-        # 图片（不设 keep_with_next，允许自然跨页）
-        for img_path in images:
-            phys = map_image_path(img_path)
-            if phys is None:
-                continue
-            try:
-                pi = cell.add_paragraph()
-                pi.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                pi.paragraph_format.space_before = Pt(6)
-                pi.paragraph_format.space_after = Pt(2)
-                ri = pi.add_run()
-                max_w = 7.2 if is_dual else 15.8
-                width = get_image_display_width(phys, max_width_cm=max_w, dpi=130)
-                ri.add_picture(phys, width=width)
-            except Exception as e:
-                print(f"  ⚠️ 图片插入失败 [{img_path}]: {e}")
-
-        # 留白
-        if not has_image:
-            bp = cell.add_paragraph()
-            bp.paragraph_format.space_before = Pt(0)
-            bp.paragraph_format.space_after = Pt(2)
-            br = bp.add_run("")
-            br.font.size = Pt(6)
-
     else:
-        # ======== 通栏模式：直接写入 Document（不用表格包裹）========
-        doc = cell_or_doc
-
-        # 大题标题 —— 保留 keep_with_next，确保序号不孤立
-        h = doc.add_paragraph()
+        # doc 模式：创建隐藏表格包裹
+        cell = _create_hidden_question_cell(cell_or_doc)
+        cell_paragraphs = cell.paragraphs
+        cell_paragraphs[0].clear()
+        h = cell_paragraphs[0]
         h.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        h.paragraph_format.space_before = Pt(6)
-        h.paragraph_format.space_after = Pt(2)
+        h.paragraph_format.space_before = Pt(0)
         h.paragraph_format.keep_with_next = True
         run_h = h.add_run(f"{idx}. {display_title}")
         run_h.bold = True
@@ -312,39 +271,50 @@ def _write_item_to_cell(cell_or_doc, item, idx, is_dual=False):
         run_h.font.name = "微软雅黑"
         run_h._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
 
-        # 题目文本（不设 keep_with_next，允许自然跨页）
-        if text:
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            p.paragraph_format.space_before = Pt(6)
-            p.paragraph_format.space_after = Pt(2)
-            rt = p.add_run(text)
-            rt.font.size = Pt(12)
-            rt.font.name = "宋体"
-            rt._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+    # 题目文字
+    if text:
+        p = cell.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        p.paragraph_format.space_before = Pt(6)
+        p.paragraph_format.space_after = Pt(0)
+        p.paragraph_format.keep_with_next = True
+        rt = p.add_run(text)
+        rt.font.size = Pt(12)
+        rt.font.name = "宋体"
+        rt._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
 
-        # 图片（不设 keep_with_next，允许自然跨页）
-        for img_path in images:
-            phys = map_image_path(img_path)
-            if phys is None:
-                continue
-            try:
-                pi = doc.add_paragraph()
-                pi.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                pi.paragraph_format.space_before = Pt(6)
-                pi.paragraph_format.space_after = Pt(2)
-                ri = pi.add_run()
-                width = get_image_display_width(phys, max_width_cm=15.8, dpi=130)
-                ri.add_picture(phys, width=width)
-            except Exception as e:
-                print(f"  ⚠️ 图片插入失败 [{img_path}]: {e}")
+    # 图片
+    for img_path in images:
+        phys = map_image_path(img_path)
+        if phys is None:
+            continue
+        try:
+            pi = cell.add_paragraph()
+            pi.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            pi.paragraph_format.space_before = Pt(6)
+            pi.paragraph_format.space_after = Pt(0)
+            ri = pi.add_run()
+            if is_dual:
+                # 双栏时固定宽度 Cm(8.0) 防止溢出
+                max_w = 8.0
+            else:
+                max_w = 15.8
+            width = get_image_display_width(phys, max_width_cm=max_w, dpi=130)
+            ri.add_picture(phys, width=width)
+        except Exception as e:
+            print(f"  ⚠️ 图片插入失败 [{img_path}]: {e}")
 
-        # 留白（通栏模式在题目之间留一点空白）
-        bp = doc.add_paragraph()
+    # 动态留白（双栏模式减少空行）
+    if is_dual:
+        blank_count = 1 if has_image else 2
+    else:
+        blank_count = 3 if has_image else 7
+    for _ in range(blank_count):
+        bp = cell.add_paragraph()
         bp.paragraph_format.space_before = Pt(0)
-        bp.paragraph_format.space_after = Pt(4)
+        bp.paragraph_format.space_after = Pt(0)
         br = bp.add_run("")
-        br.font.size = Pt(6)
+        br.font.size = Pt(12)
 
 
 # ============================================================
@@ -757,10 +727,10 @@ def map_image_path(api_image_path):
 def estimate_lines(item):
     text = item[4] if len(item) > 4 else ""
     images = item[5] if len(item) > 5 else []
-    title_lines = 1
-    text_lines = max(1, math.ceil(len(text) / 50))
-    image_lines = len(images) * 12
-    blank_lines = 1  # 统一减少 30%+
+    title_lines = 2
+    text_lines = max(1, math.ceil(len(text) / 40))
+    image_lines = len(images) * 20
+    blank_lines = 3 if images else 7
     return title_lines + text_lines + image_lines + blank_lines
 
 
@@ -857,38 +827,6 @@ def select_questions(all_docs):
 # ============================================================
 #  Word 导出 —— 练习卷
 # ============================================================
-def _lines_remaining_in_page(doc):
-    """
-    估算当前页面剩余行数。
-    基于文档当前段落数、表格数进行粗略估算。
-    标准 A4 页面（上下边距各 1.27cm）可用行数约 45 行。
-    """
-    # 保守估算每行高度约 0.55cm (14pt 字体)
-    # 可用高度: 29.7 - 1.27*2 = 27.16cm
-    # 可用行数 ≈ 27.16 / 0.55 ≈ 49 行
-    max_lines = 48
-
-    # 估算已使用行数：每个段落算 1 行基线 + 额外行数
-    used_lines = 1  # 标题
-    for p in doc.paragraphs:
-        text = p.text
-        if text:
-            used_lines += max(1, math.ceil(len(text) / 50))
-
-    # 估算表格行数
-    for table in doc.tables:
-        for row in table.rows:
-            # 每行表格算 2 行基线，加上单元格文字
-            used_lines += 2
-            for cell in row.cells:
-                for p in cell.paragraphs:
-                    if p.text:
-                        used_lines += max(1, math.ceil(len(p.text) / 40))
-
-    remaining = max_lines - used_lines
-    return max(0, remaining)
-
-
 def create_practice_doc(selected_items, current_time_str, target_folders_str):
     doc = Document()
 
@@ -925,17 +863,20 @@ def create_practice_doc(selected_items, current_time_str, target_folders_str):
             # 小型题 → 加入 buffer
             buffer.append((global_idx, item))
             if len(buffer) == 2:
-                # 集齐两道：创建 1 行 2 列无边框表格（严禁跨页，保持双栏左右对齐）
+                # 集齐两道：创建 1 行 2 列无边框表格
                 dual_table = doc.add_table(rows=1, cols=2)
-                dual_table.rows[0].allow_break_across_pages = False
                 _set_no_border(dual_table)
+                # 设置左单元格右边距 0.25cm、右单元格左边距 0.25cm 以产生视觉间隔
                 left_cell = dual_table.cell(0, 0)
                 right_cell = dual_table.cell(0, 1)
+                # 在左右单元格中间加一条浅灰色竖线（视觉分隔）
                 _set_hidden_cell_borders(left_cell)
                 _set_hidden_cell_borders(right_cell)
-                # 设置列宽为固定相等值
-                left_cell.width = Cm(9.5)
-                right_cell.width = Cm(9.5)
+                # 设置列宽
+                left_cell.width = Cm(10.0)
+                right_cell.width = Cm(10.0)
+                # 允许行跨页拆分，避免整行跳页
+                dual_table.rows[0].allow_break_across_pages = True
 
                 idx1, item1 = buffer[0]
                 idx2, item2 = buffer[1]
@@ -943,7 +884,10 @@ def create_practice_doc(selected_items, current_time_str, target_folders_str):
                 _write_item_to_cell(right_cell, item2, idx2, is_dual=True)
 
                 # 双栏间加浅灰色分隔竖线
+                tbl = dual_table._tbl
+                # 为右单元格添加左边框（浅灰细线）
                 tc_pr_left = left_cell._tc.get_or_add_tcPr()
+                # 移除旧边框
                 existing_left = tc_pr_left.findall(qn('w:tcBorders'))
                 for e in existing_left:
                     tc_pr_left.remove(e)
@@ -959,15 +903,15 @@ def create_practice_doc(selected_items, current_time_str, target_folders_str):
 
                 buffer = []
         else:
-            # 大型题（通栏）→ 先 flush buffer
+            # 大型题 → 先 flush buffer
             for buf_idx, buf_item in buffer:
                 _write_item_to_cell(doc, buf_item, buf_idx, is_dual=False)
             buffer = []
 
-            # 通栏题目允许自然跨页，不做强制换页判断
+            # 普通全宽写入当前大型题
             _write_item_to_cell(doc, item, global_idx, is_dual=False)
 
-    # 收尾：buffer 中最后一道题（通栏写入，允许自然跨页）
+    # 收尾：buffer 中剩 1 道题
     for buf_idx, buf_item in buffer:
         _write_item_to_cell(doc, buf_item, buf_idx, is_dual=False)
 
@@ -1132,12 +1076,6 @@ def main():
     print(f"{'=' * 60}")
 
     selected = select_questions(all_docs)
-
-    # 智能高度排序：将小型题按高度升序排列，利于双栏完美结对
-    compact_items = [item for item in selected if is_compact_item(item)]
-    normal_items = [item for item in selected if not is_compact_item(item)]
-    compact_items.sort(key=lambda x: estimate_lines(x))
-    selected = compact_items + normal_items
 
     if not selected:
         print("\n❌ 没有符合选题条件的题目。")
