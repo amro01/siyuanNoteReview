@@ -1,0 +1,912 @@
+import requests
+import json
+import re
+import os
+import sys
+import math
+from datetime import datetime
+
+from docx import Document
+from docx.shared import Cm, Pt, Emu, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+from docx.oxml.ns import qn, nsdecls
+from docx.oxml import parse_xml
+
+# ============================================================
+#  配置加载
+# ============================================================
+def load_config(config_path="config.json"):
+    """
+    从 config.json 加载配置，并将变量设置到模块全局作用域。
+    如果文件不存在，给出友好提示并退出。
+    """
+    if not os.path.isfile(config_path):
+        print(f"❌ 未找到配置文件 {config_path}")
+        print("   请复制 config.json.example 为 config.json，并填写你的实际配置。")
+        print("   参考命令: cp config.json.example config.json")
+        sys.exit(1)
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    # 将配置注入模块全局变量
+    global SIYUAN_URL, API_TOKEN, NOTEBOOK_ID, SIYUAN_DATA_PATH
+    global TARGET_FOLDERS, SCORE_THRESHOLD, MIN_PAGES, HEADERS
+
+    SIYUAN_URL = cfg["SIYUAN_URL"]
+    API_TOKEN = cfg["API_TOKEN"]
+    NOTEBOOK_ID = cfg["NOTEBOOK_ID"]
+    SIYUAN_DATA_PATH = cfg["SIYUAN_DATA_PATH"]
+    TARGET_FOLDERS = cfg["TARGET_FOLDERS"]
+    SCORE_THRESHOLD = cfg["SCORE_THRESHOLD"]
+    MIN_PAGES = cfg["MIN_PAGES"]
+
+    HEADERS = {
+        "Authorization": f"Token {API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+
+# 脚本入口时自动加载配置
+load_config()
+
+
+# ============================================================
+#  通用 API 调用
+# ============================================================
+def call_api(endpoint, payload=None):
+    url = f"{SIYUAN_URL}{endpoint}"
+    try:
+        resp = requests.post(url, headers=HEADERS, json=payload, timeout=10)
+        if resp.status_code != 200:
+            return {"code": -1, "msg": f"HTTP {resp.status_code}: {resp.text}"}
+        data = resp.json()
+        if data.get("code") != 0:
+            return {"code": data.get("code", -1), "msg": data.get("msg", "未知错误")}
+        return data
+    except requests.exceptions.Timeout:
+        return {"code": -1, "msg": "请求超时"}
+    except requests.exceptions.ConnectionError:
+        return {"code": -1, "msg": f"无法连接到 {SIYUAN_URL}"}
+    except json.JSONDecodeError:
+        return {"code": -1, "msg": "返回非 JSON 格式"}
+    except Exception as e:
+        return {"code": -1, "msg": str(e)}
+
+
+# ============================================================
+#  Word 辅助函数
+# ============================================================
+def _set_no_border(table):
+    """移除表格所有边框（彻底隐藏）"""
+    tbl = table._tbl
+    tblPr = tbl.tblPr if tbl.tblPr is not None else parse_xml(f'<w:tblPr {nsdecls("w")}/>')
+    # 先移除已有边框
+    existing = tblPr.findall(qn('w:tblBorders'))
+    for e in existing:
+        tblPr.remove(e)
+    borders = parse_xml(
+        f'<w:tblBorders {nsdecls("w")}>'
+        '  <w:top w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
+        '  <w:left w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
+        '  <w:bottom w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
+        '  <w:right w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
+        '  <w:insideH w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
+        '  <w:insideV w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
+        '</w:tblBorders>'
+    )
+    tblPr.append(borders)
+
+
+def _set_hidden_cell_borders(cell):
+    """隐藏单单元格的所有边框"""
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    # 移除旧边框
+    existing = tcPr.findall(qn('w:tcBorders'))
+    for e in existing:
+        tcPr.remove(e)
+    tcBorders = parse_xml(
+        f'<w:tcBorders {nsdecls("w")}>'
+        '  <w:top w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
+        '  <w:left w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
+        '  <w:bottom w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
+        '  <w:right w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
+        '</w:tcBorders>'
+    )
+    tcPr.append(tcBorders)
+
+
+def _create_hidden_question_cell(doc):
+    """创建一个包裹单道题目的无边框表格单元格"""
+    table = doc.add_table(rows=1, cols=1)
+    _set_no_border(table)
+    cell = table.cell(0, 0)
+    _set_hidden_cell_borders(cell)
+    return cell
+
+
+def _add_footer(section, footer_text):
+    """添加页脚（居中、小字）"""
+    footer = section.footer
+    footer.is_linked_to_previous = False
+    fp = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+    fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    fp.paragraph_format.space_before = Pt(0)
+    fp.paragraph_format.space_after = Pt(0)
+    fr = fp.add_run(footer_text)
+    fr.font.size = Pt(9)
+    fr.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
+    fr.font.name = "微软雅黑"
+    fr._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+
+
+# ============================================================
+#  目录 & 文件遍历
+# ============================================================
+def list_dir_entries(dir_path):
+    result = call_api("/api/file/readDir", {"path": dir_path})
+    if result.get("code") != 0:
+        print(f"  ⚠️  读取目录失败 [{dir_path}]：{result.get('msg')}")
+        return []
+    return result.get("data", [])
+
+
+def find_target_dirs():
+    root_path = f"/data/{NOTEBOOK_ID}"
+    entries = list_dir_entries(root_path)
+
+    matched = []
+    for entry in entries:
+        if not entry.get("isDir", False):
+            continue
+        dir_id = entry.get("name", "")
+        if dir_id.startswith("."):
+            continue
+
+        title = get_doc_title(dir_id)
+        if title is None:
+            continue
+
+        for target in TARGET_FOLDERS:
+            if target in title:
+                matched.append({
+                    "name": target,
+                    "path": f"{root_path}/{dir_id}"
+                })
+                break
+
+    return matched
+
+
+def list_sy_files_in_dir(dir_path):
+    entries = list_dir_entries(dir_path)
+    sy_files = []
+    for entry in entries:
+        name = entry.get("name", "")
+        if name.endswith(".sy") and not entry.get("isDir", False):
+            doc_id = name[:-3]
+            sy_files.append((name, doc_id))
+    return sy_files
+
+
+def get_doc_title(doc_id):
+    result = call_api("/api/filetree/getHPathByID", {"id": doc_id})
+    if result.get("code") != 0:
+        return None
+    return result.get("data")
+
+
+# ============================================================
+#  分类 / 标题格式化
+# ============================================================
+def classify_document(title):
+    t = title
+    if "困难" in t:
+        return "困难"
+    if "易错" in t:
+        return "易错"
+    if "基础" in t:
+        return "基础"
+    return "基础"
+
+
+def extract_parent_ds(title):
+    parts = title.lstrip("/").split("/")
+    if len(parts) >= 1:
+        first = parts[0]
+        m = re.search(r'(DS\d+)', first)
+        if m:
+            return m.group(1)
+        return first.split("#")[0].strip()
+    return ""
+
+
+def format_question_title(full_title):
+    parent_ds = extract_parent_ds(full_title)
+
+    parts = full_title.split("/")
+    last = parts[-1] if parts else full_title
+
+    num_match = re.match(r'(\d+)', last)
+    doc_num = num_match.group(1) if num_match else ""
+
+    if parent_ds and doc_num:
+        return f"{parent_ds}: {doc_num}"
+    elif parent_ds:
+        return parent_ds
+    elif doc_num:
+        return doc_num
+    else:
+        clean = last.split("#")[0].strip()
+        return clean
+
+
+def shorten_title(title):
+    parts = title.split("/")
+    last = parts[-1] if parts else title
+    clean = last.split("#")[0].strip()
+    return clean
+
+
+# ============================================================
+#  文档源码获取
+# ============================================================
+def get_block_kramdown(doc_id):
+    result = call_api("/api/block/getBlockKramdown", {"id": doc_id})
+    if result.get("code") != 0:
+        return None
+    data = result.get("data")
+    if isinstance(data, dict):
+        return data.get("kramdown", "")
+    return ""
+
+
+# ============================================================
+#  积分表解析（重写版）
+# ============================================================
+def parse_score_table(md_source):
+    """
+    解析文档中第一个包含"总积分"字样的 Markdown 表格。
+    特征：表格固定 5 列，行可能以 | 或 || 开头。
+    逻辑：
+      - 用 re.findall 抓取表格块（| 开头到空行之间的段落）
+      - 找到包含"总积分"的表格
+      - 按行分割，从最后一行向上寻找数据行
+      - 按 | 分割，取最后一个非空元素（从后往前数）
+      - 清理 {:...} 属性后提取数字
+    返回 int，无表格返回 None。
+    """
+    if not md_source:
+        return None
+
+    # 1) 用 re.findall 抓取所有表格块
+    # 表格块：以 | 开头，空行结束的连续段落
+    table_blocks = re.findall(r'^(?:\|.*\n?)+', md_source, re.MULTILINE)
+
+    # 2) 找到包含"总积分"的表格
+    target_block = None
+    for block in table_blocks:
+        if "总积分" in block:
+            target_block = block
+            break
+
+    if target_block is None:
+        return None
+
+    # 3) 按行分割
+    lines = [l.strip() for l in target_block.split("\n") if l.strip()]
+
+    # 4) 从最后一行向上寻找数据行（跳过分隔行和空行）
+    data_line = None
+    for line in reversed(lines):
+        # 跳过纯分隔行
+        if re.match(r'^[\s\|:\-]+$', line) and "---" in line:
+            continue
+        # 跳过太短的行
+        if line.count("|") < 2:
+            continue
+        data_line = line
+        break
+
+    if data_line is None:
+        return None
+
+    # 调试：打印原始行
+    print(f"  [DEBUG] 识别到的最后一行: {data_line}")
+
+    # 5) 按 | 分割，取最后一个非空元素
+    parts = [p.strip() for p in data_line.split("|")]
+    # 过滤空字符串
+    non_empty = [p for p in parts if p]
+    if not non_empty:
+        return None
+    last_val_raw = non_empty[-1]
+
+    # 6) 清理 {:...} 属性
+    last_val_clean = re.sub(r'\{:\s*[^}]*\}', '', last_val_raw).strip()
+
+    print(f"  [DEBUG] 找到总积分列内容: {last_val_clean}")
+
+    # 7) 提取数字
+    m = re.search(r'(\d+(?:\.\d+)?)', last_val_clean)
+    if m:
+        return int(float(m.group(1)))
+    return None
+
+
+# ============================================================
+#  精准题目解析（练习卷用）— 重写版
+# ============================================================
+def parse_question(md_source):
+    """
+    从源码中提取题目内容。
+    匹配：以 # 题目 或 ## 题目 开头的行。
+    结束：以 ## 答案 开头的行。
+    提取图片路径时需在清理 {:...} 之前执行。
+    """
+    if not md_source:
+        return None
+
+    raw_lines = md_source.split("\n")
+
+    # 寻找 # 题目 或 ## 题目
+    start_idx = -1
+    for i, line in enumerate(raw_lines):
+        s = line.strip()
+        if re.match(r'^#{1,2}\s+题目', s):
+            start_idx = i
+            break
+
+    if start_idx == -1:
+        return None
+
+    # 截取到 ## 答案 为止
+    content_lines = []
+    for line in raw_lines[start_idx + 1:]:
+        s = line.strip()
+        if re.match(r'^##\s*答案', s):
+            break
+        if re.match(r'^##\s*💡\s*答案', s):
+            break
+        content_lines.append(line)
+
+    # 先提取图片路径（在清理 {:...} 之前！）
+    image_paths = []
+    for line in content_lines:
+        for m in re.finditer(r'!\[.*?\]\((/?)assets/([^)]+)\)', line):
+            prefix = "/" if m.group(1) else ""
+            full = f"{prefix}assets/{m.group(2)}"
+            if full not in image_paths:
+                image_paths.append(full)
+
+    # 再清理 {:...} 和提取文字
+    text_parts = []
+    for line in content_lines:
+        # 清理 {: id="..."}
+        s = re.sub(r'\{:\s*[^}]*\}', '', line).strip()
+        # 去掉开头的 >
+        s = re.sub(r'^>\s*', '', s)
+        # 清理行内图片标记和 [图片] 占位
+        s = re.sub(r'!\[.*?\]\([^)]+\)', '', s)
+        s = re.sub(r'\s*\[图片\]\s*', '', s)
+        if s.strip():
+            text_parts.append(s.strip())
+
+    text = "\n".join(text_parts).strip()
+    text = re.sub(r'\s*\[图片\]\s*', '', text)
+
+    if not text and not image_paths:
+        return None
+
+    return {"text": text, "images": image_paths}
+
+
+# ============================================================
+#  答案解析（答案卷用）— 重写版
+# ============================================================
+def parse_answer(md_source):
+    """
+    从源码中提取答案内容。
+    匹配：以 ## 答案 或 ## 💡 答案 开头的二级标题。
+    结束：以 ## 扩展题目 或下一个 ## 标题开头。
+    提取图片路径时需在清理 {:...} 之前执行。
+    返回 {"text": "...", "images": [...]}，没有则返回 None。
+    """
+    if not md_source:
+        return None
+
+    raw_lines = md_source.split("\n")
+
+    # 定位 ## 答案（兼容各种写法：## 答案、## 💡 答案、##💡答案等）
+    start_idx = -1
+    for i, line in enumerate(raw_lines):
+        s = line.strip()
+        if re.match(r'^##[^#]*答案', s):
+            start_idx = i
+            break
+
+    if start_idx == -1:
+        return None
+
+    # 取到下一个 ## 或文档结尾，但跳过 "## 扩展题目"
+    content_lines = []
+    for line in raw_lines[start_idx + 1:]:
+        s = line.strip()
+        if s.startswith("##"):
+            # 如果是 "## 扩展题目"，结束；其他二级标题也结束
+            break
+        content_lines.append(line)
+
+    # 先提取图片路径（在清理 {:...} 之前！）
+    image_paths = []
+    for line in content_lines:
+        for m in re.finditer(r'!\[.*?\]\((/?)assets/([^)]+)\)', line):
+            prefix = "/" if m.group(1) else ""
+            full = f"{prefix}assets/{m.group(2)}"
+            if full not in image_paths:
+                image_paths.append(full)
+
+    # 再清理 {:...} 和提取文字
+    text_parts = []
+    for line in content_lines:
+        # 清理 {: id="..."}
+        s = re.sub(r'\{:\s*[^}]*\}', '', line).strip()
+        # 去掉开头的 >
+        s = re.sub(r'^>\s*', '', s)
+        # 清理行内图片标记和 [图片] 占位
+        s = re.sub(r'!\[.*?\]\([^)]+\)', '', s)
+        s = re.sub(r'\s*\[图片\]\s*', '', s)
+        if s.strip():
+            text_parts.append(s.strip())
+
+    text = "\n".join(text_parts).strip()
+    text = re.sub(r'\s*\[图片\]\s*', '', text)
+
+    if not text and not image_paths:
+        # 调试：打印原始 Kramdown 前 100 字符
+        print(f"  [DEBUG] parse_answer 提取为空，原始 Kramdown 前 100 字符:")
+        print(f"  [DEBUG] {md_source[:100]!r}")
+        return None
+
+    return {"text": text, "images": image_paths}
+
+
+# ============================================================
+#  物理图片路径映射（增强版）
+# ============================================================
+def map_image_path(api_image_path):
+    """
+    将思源 API 返回的图片路径映射到物理文件路径。
+    支持多种路径格式：
+      - /assets/xxx.png
+      - assets/xxx.png
+      - /data/{NOTEBOOK_ID}/assets/xxx.png
+    """
+    clean = api_image_path.lstrip("/")
+
+    # 候选 1: SIYUAN_DATA_PATH / assets/xxx.png
+    cand = os.path.join(SIYUAN_DATA_PATH, clean)
+    if os.path.isfile(cand):
+        return cand
+
+    # 候选 2: SIYUAN_DATA_PATH / notebook_id / assets/xxx.png
+    cand = os.path.join(SIYUAN_DATA_PATH, NOTEBOOK_ID, clean)
+    if os.path.isfile(cand):
+        return cand
+
+    # 候选 3: 如果 clean 包含 notebook_id/，去掉 notebook_id/ 前缀再试
+    if clean.startswith(NOTEBOOK_ID + "/"):
+        sub = clean[len(NOTEBOOK_ID) + 1:]
+        cand = os.path.join(SIYUAN_DATA_PATH, sub)
+        if os.path.isfile(cand):
+            return cand
+
+    # 候选 4: 用 basename 在 data 根目录和笔记本目录下搜索
+    for root_dir in [SIYUAN_DATA_PATH, os.path.join(SIYUAN_DATA_PATH, NOTEBOOK_ID)]:
+        full = os.path.join(root_dir, os.path.basename(clean))
+        if os.path.isfile(full):
+            return full
+
+    # 候选 5: 尝试处理类似 /data/{NOTEBOOK_ID}/assets/xxx.png 这样的完整路径
+    # 如果 api_image_path 以 /data/ 开头，直接替换 SIYUAN_DATA_PATH
+    if api_image_path.startswith("/data/"):
+        cand = api_image_path.replace("/data/", SIYUAN_DATA_PATH + "/", 1)
+        if os.path.isfile(cand):
+            return cand
+
+    return None
+
+
+# ============================================================
+#  页数估算
+# ============================================================
+def estimate_lines(item):
+    text = item[4] if len(item) > 4 else ""
+    images = item[5] if len(item) > 5 else []
+    title_lines = 2
+    text_lines = max(1, math.ceil(len(text) / 40))
+    image_lines = len(images) * 20
+    blank_lines = 3 if images else 7
+    return title_lines + text_lines + image_lines + blank_lines
+
+
+def estimate_total_pages(items):
+    if not items:
+        return 0
+    total_lines = sum(estimate_lines(it) for it in items)
+    lines_per_page = 50
+    return max(1, math.ceil(total_lines / lines_per_page))
+
+
+# ============================================================
+#  选题引擎 (Selection Engine)
+# ============================================================
+def select_questions(all_docs):
+    """
+    all_docs: [(doc_id, title, category, score, answer_md_source_or_None), ...]
+    返回最终入选的文档列表 [(doc_id, title, cat, score, text, images, answer_md), ...]
+    """
+    # 1) 初筛：总积分 < SCORE_THRESHOLD 或 积分未检测到
+    eligible = []
+    skipped_texts = []
+    for d in all_docs:
+        doc_id, title, cat, score = d[:4]
+        if score is not None:
+            if score >= SCORE_THRESHOLD:
+                short = shorten_title(title)
+                skipped_texts.append(short)
+                print(f"跳过已掌握题目：{short}")
+                continue
+        eligible.append(d)
+
+    if skipped_texts:
+        print()
+
+    # 2) 分类收集
+    pools = {"基础": [], "易错": [], "困难": []}
+    for d in eligible:
+        cat = d[2]
+        pools.setdefault(cat, []).append(d)
+
+    def fetch_content(item):
+        doc_id, title, cat, score = item[:4]
+        md = get_block_kramdown(doc_id)
+        parsed = parse_question(md) if md else None
+        if parsed:
+            # 额外保存原始 md 给答案卷用
+            return (doc_id, title, cat, score, parsed["text"], parsed["images"], md)
+        return None
+
+    # 3) 基础 + 易错 全部入选
+    selected = []
+    for cat in ["基础", "易错"]:
+        for d in pools.get(cat, []):
+            item = fetch_content(d)
+            if item:
+                selected.append(item)
+
+    # 4) 页数不足时从困难池补充
+    current_pages = estimate_total_pages(selected)
+    print(f"📊 当前已选题数: {len(selected)}，估算页数: ~{current_pages} 页")
+
+    if current_pages < MIN_PAGES and pools.get("困难"):
+        needed = pools["困难"]
+        def sort_key(d):
+            s = d[3]
+            return -1 if s is None else s
+        needed.sort(key=sort_key, reverse=True)
+
+        print(f"📌 页数不足 {MIN_PAGES} 页，从困难池补充 {len(needed)} 道候选题……")
+
+        for d in needed:
+            if estimate_total_pages(selected) >= MIN_PAGES:
+                break
+            item = fetch_content(d)
+            if item:
+                selected.append(item)
+                print(f"   ➕ 补充: {shorten_title(d[1])} (积分: {d[3]})")
+    elif current_pages < MIN_PAGES:
+        # ⚠️ 黄色警告：页数不足且无困难题可补
+        yellow = "\033[93m"
+        reset = "\033[0m"
+        print(f"\n{yellow}{'⚠️ ' * 10}")
+        print(f"  ⚠️  警告：当前仅 ~{current_pages} 页，不足 {MIN_PAGES} 页，")
+        print('       且无"困难"题可补充。请考虑增加 TARGET_FOLDERS 范围')
+        print(f"       或降低 SCORE_THRESHOLD 阈值。")
+        print(f"{'⚠️ ' * 10}{reset}\n")
+
+    final_pages = estimate_total_pages(selected)
+    print(f"📊 最终选题数: {len(selected)}，估算页数: ~{final_pages} 页")
+    return selected
+
+
+# ============================================================
+#  Word 导出 —— 练习卷
+# ============================================================
+def create_practice_doc(selected_items, current_time_str, target_folders_str):
+    doc = Document()
+
+    # ---------- 页面设置 ----------
+    sec = doc.sections[0]
+    sec.page_width = Cm(21.0)
+    sec.page_height = Cm(29.7)
+    sec.top_margin = Cm(1.27)
+    sec.bottom_margin = Cm(1.27)
+    sec.left_margin = Cm(1.27)
+    sec.right_margin = Cm(1.27)
+
+    # ---------- 页脚 ----------
+    footer_text = f"范围：{target_folders_str} | 生成时间：{current_time_str}"
+    _add_footer(sec, footer_text)
+
+    # ---------- 卷头标题 ----------
+    tp = doc.add_paragraph()
+    tp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    tp.paragraph_format.space_before = Pt(6)
+    tp.paragraph_format.space_after = Pt(12)
+    r = tp.add_run(f"今日练习 {current_time_str[:10]}")
+    r.bold = True
+    r.font.size = Pt(16)
+    r.font.name = "微软雅黑"
+    r._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+
+    # ---------- 遍历每道大题 ----------
+    for idx, item in enumerate(selected_items, 1):
+        doc_id, full_title, cat, score, text, images, answer_md = item
+
+        display_title = format_question_title(full_title)
+
+        # 无边框表格包裹
+        cell = _create_hidden_question_cell(doc)
+
+        cell_paragraphs = cell.paragraphs
+        cell_paragraphs[0].clear()
+
+        # 大题标题
+        h = cell_paragraphs[0]
+        h.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        run_h = h.add_run(f"{idx}. {display_title}")
+        run_h.bold = True
+        run_h.font.size = Pt(14)
+        run_h.font.name = "微软雅黑"
+        run_h._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+
+        # 题目文字
+        if text:
+            p = cell.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            p.paragraph_format.space_before = Pt(6)
+            p.paragraph_format.space_after = Pt(0)
+            rt = p.add_run(text)
+            rt.font.size = Pt(12)
+            rt.font.name = "宋体"
+            rt._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+
+        has_image = bool(images)
+
+        # 图片
+        for img_path in images:
+            phys = map_image_path(img_path)
+            if phys is None:
+                continue
+            try:
+                pi = cell.add_paragraph()
+                pi.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                pi.paragraph_format.space_before = Pt(6)
+                pi.paragraph_format.space_after = Pt(0)
+                ri = pi.add_run()
+                ri.add_picture(phys, width=Cm(15.8))
+            except Exception as e:
+                print(f"  ⚠️ 图片插入失败 [{img_path}]: {e}")
+
+        # 动态留白
+        blank_count = 3 if has_image else 7
+        for _ in range(blank_count):
+            bp = cell.add_paragraph()
+            bp.paragraph_format.space_before = Pt(0)
+            bp.paragraph_format.space_after = Pt(0)
+            br = bp.add_run("")
+            br.font.size = Pt(12)
+
+        # 大题间隔
+        if idx < len(selected_items):
+            gap = cell.add_paragraph()
+            gap.paragraph_format.space_before = Pt(0)
+            gap.paragraph_format.space_after = Pt(0)
+            gr = gap.add_run("")
+            gr.font.size = Pt(12)
+
+    return doc
+
+
+# ============================================================
+#  Word 导出 —— 答案卷（无隐藏表格，自然跨页）
+# ============================================================
+def create_answer_doc(selected_items, current_time_str, target_folders_str):
+    doc = Document()
+
+    # ---------- 页面设置 ----------
+    sec = doc.sections[0]
+    sec.page_width = Cm(21.0)
+    sec.page_height = Cm(29.7)
+    sec.top_margin = Cm(1.27)
+    sec.bottom_margin = Cm(1.27)
+    sec.left_margin = Cm(1.27)
+    sec.right_margin = Cm(1.27)
+
+    # ---------- 页脚 ----------
+    footer_text = f"范围：{target_folders_str} | 生成时间：{current_time_str}"
+    _add_footer(sec, footer_text)
+
+    # ---------- 卷头标题 ----------
+    tp = doc.add_paragraph()
+    tp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    tp.paragraph_format.space_before = Pt(6)
+    tp.paragraph_format.space_after = Pt(12)
+    r = tp.add_run(f"【答案】今日练习 {current_time_str[:10]}")
+    r.bold = True
+    r.font.size = Pt(16)
+    r.font.name = "微软雅黑"
+    r._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+
+    # ---------- 遍历每道题（直接写在文档主体中，允许自然跨页）----------
+    for idx, item in enumerate(selected_items, 1):
+        doc_id, full_title, cat, score, text, images, answer_md = item
+
+        display_title = format_question_title(full_title)
+
+        # 解析答案
+        answer_data = parse_answer(answer_md) if answer_md else None
+        answer_text = answer_data["text"] if answer_data else ""
+        answer_images = answer_data["images"] if answer_data else []
+
+        # 答案标题（直接添加到文档）
+        h = doc.add_paragraph()
+        h.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        run_h = h.add_run(f"{idx}. 【答案】{display_title}")
+        run_h.bold = True
+        run_h.font.size = Pt(12)
+        run_h.font.name = "微软雅黑"
+        run_h._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+
+        # 答案文字（左对齐，间距紧凑）
+        if answer_text:
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            p.paragraph_format.space_before = Pt(2)
+            p.paragraph_format.space_after = Pt(2)
+            rt = p.add_run(answer_text)
+            rt.font.size = Pt(11)
+            rt.font.name = "宋体"
+            rt.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
+            rt._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+
+        # 答案图片（居中）
+        for img_path in answer_images:
+            phys = map_image_path(img_path)
+            if phys is None:
+                continue
+            try:
+                pi = doc.add_paragraph()
+                pi.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                pi.paragraph_format.space_before = Pt(2)
+                pi.paragraph_format.space_after = Pt(2)
+                ri = pi.add_run()
+                ri.add_picture(phys, width=Cm(15.8))
+            except Exception as e:
+                print(f"  ⚠️ 答案图片插入失败 [{img_path}]: {e}")
+
+        # 紧凑排版：题目之间空半行
+        if idx < len(selected_items):
+            gap = doc.add_paragraph()
+            gap.paragraph_format.space_before = Pt(0)
+            gap.paragraph_format.space_after = Pt(4)
+            gr = gap.add_run("")
+            gr.font.size = Pt(12)
+
+    return doc
+
+
+# ============================================================
+#  主流程
+# ============================================================
+def main():
+    now = datetime.now()
+    current_time_str = now.strftime('%Y-%m-%d %H:%M')
+    file_time_str = now.strftime('%Y%m%d_%H%M')
+
+    practice_filename = f"今日练习_{file_time_str}.docx"
+    answer_filename = f"今日练习_答案_{file_time_str}.docx"
+
+    target_folders_str = ", ".join(TARGET_FOLDERS)
+
+    print("=" * 60)
+    print("📋 思源笔记 —— 错题拼卷机")
+    print("=" * 60)
+
+    print(f"\n🎯 当前选题范围: {TARGET_FOLDERS}")
+    print(f"   积分阈值: < {SCORE_THRESHOLD} (已掌握跳过)")
+    print(f"   目标页数: >= {MIN_PAGES} 页")
+    print()
+
+    # 1) 查找目录
+    target_dirs = find_target_dirs()
+    if not target_dirs:
+        print(f"\n❌ 未找到匹配的目录: {TARGET_FOLDERS}")
+        print("   请确认笔记本下存在名为 DS0001 / DS0002 等目录。")
+        return
+
+    print(f"📁 正在针对以下目录扫描：")
+    for d in target_dirs:
+        print(f"   📂 {d['name']}  ({d['path']})")
+
+    # 2) 收集文档
+    all_docs = []  # [(doc_id, title, cat, score)]
+    for td in target_dirs:
+        sy_files = list_sy_files_in_dir(td["path"])
+        print(f"\n📂 [{td['name']}] 找到 {len(sy_files)} 个文档")
+
+        for name, doc_id in sy_files:
+            title = get_doc_title(doc_id)
+            if title is None:
+                print(f"   ⚠️  {name} → 获取标题失败")
+                continue
+
+            cat = classify_document(title)
+            short = shorten_title(title)
+
+            print(f"   📄 {name} → {short}  [{cat}]")
+
+            md = get_block_kramdown(doc_id)
+            score = parse_score_table(md) if md else None
+            if score is not None:
+                print(f"       总积分: {score}")
+            else:
+                print(f"       总积分: 未检测到积分表")
+
+            all_docs.append((doc_id, title, cat, score))
+
+    if not all_docs:
+        print("\n❌ 未找到任何文档。")
+        return
+
+    # 3) 选题
+    print(f"\n{'=' * 60}")
+    print("🎯 选题引擎启动")
+    print(f"{'=' * 60}")
+
+    selected = select_questions(all_docs)
+
+    if not selected:
+        print("\n❌ 没有符合选题条件的题目。")
+        return
+
+    # 4) 生成练习卷
+    print(f"\n{'=' * 60}")
+    print(f"📦 正在生成练习卷 ({len(selected)} 道大题)……")
+    practice_doc = create_practice_doc(selected, current_time_str, target_folders_str)
+
+    practice_path = os.path.abspath(practice_filename)
+    practice_doc.save(practice_path)
+    print(f"\n✅ 练习卷已保存: {practice_path}")
+
+    # 5) 生成答案卷
+    print(f"\n📦 正在生成答案卷 ({len(selected)} 道)……")
+    answer_doc = create_answer_doc(selected, current_time_str, target_folders_str)
+
+    answer_path = os.path.abspath(answer_filename)
+    answer_doc.save(answer_path)
+    print(f"\n✅ 答案卷已保存: {answer_path}")
+
+    print(f"\n{'=' * 60}")
+    print(f"📊 统计")
+    print(f"   共 {len(selected)} 道大题")
+    print(f"   练习卷: {practice_filename}")
+    print(f"   答案卷: {answer_filename}")
+    print(f"   估算 ~{estimate_total_pages(selected)} 页 (A4)")
+    print(f"{'=' * 60}")
+
+
+if __name__ == "__main__":
+    main()

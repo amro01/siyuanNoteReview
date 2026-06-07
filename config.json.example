@@ -1,0 +1,9 @@
+{
+    "SIYUAN_URL": "http://YOUR_WINDOWS_IP:6806",
+    "API_TOKEN": "YOUR_API_TOKEN",
+    "NOTEBOOK_ID": "YOUR_NOTEBOOK_ID",
+    "SIYUAN_DATA_PATH": "/path/to/siyuan/workspace/data",
+    "TARGET_FOLDERS": ["DS0001"],
+    "SCORE_THRESHOLD": 3,
+    "MIN_PAGES": 2
+}

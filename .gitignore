@@ -1,0 +1,20 @@
+# 你要忽略的文件
+*.docx
+config.json
+__pycache__/
+.vscode/
+计划.md
+
+# Python 常用忽略（推荐一起加上，避免上传垃圾文件）
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+.venv/
+build/
+dist/
+*.egg-info/
+.ipynb_checkpoints/
+.idea/
+.DS_Store
