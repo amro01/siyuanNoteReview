@@ -1,9 +1,13 @@
 # 你要忽略的文件
+*.pdf
 *.docx
+数学错题模板03.md
+siyuan_client.py.bak
 config.json
 __pycache__/
 .vscode/
 计划.md
+
 
 # Python 常用忽略（推荐一起加上，避免上传垃圾文件）
 *.pyc

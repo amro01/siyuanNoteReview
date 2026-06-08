@@ -1,24 +1,42 @@
+# -*- coding: utf-8 -*-
+"""
+思源笔记 —— 错题拼卷机 (HTML+WeasyPrint 版)
+
+依赖安装：
+  pip install requests Pillow python-docx weasyprint
+
+功能：
+  1. 从思源笔记 API 获取文档内容
+  2. 按积分筛选已掌握/待练习题目
+  3. 生成 HTML 练习卷 + 答案卷，使用 CSS 打印媒体排版
+  4. 用 WeasyPrint 将 HTML 编译为 PDF
+"""
+
 import requests
 import json
 import re
 import os
 import sys
 import math
+import html
+import urllib.parse
 from datetime import datetime
-
-from docx import Document
-from docx.shared import Cm, Pt, Emu, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
-from docx.enum.table import WD_ALIGN_VERTICAL
-from docx.oxml.ns import qn, nsdecls
-from docx.oxml import parse_xml
 
 try:
     from PIL import Image
     _HAS_PIL = True
 except ImportError:
     _HAS_PIL = False
-    print("⚠️  未安装 Pillow，将使用固定图片宽度。请运行: pip install Pillow")
+    print("⚠️  未安装 Pillow，将使用保守的紧凑判断。请运行: pip install Pillow")
+
+try:
+    from weasyprint import HTML
+    from weasyprint.text.fonts import FontConfiguration
+    _HAS_WEASYPRINT = True
+except ImportError:
+    _HAS_WEASYPRINT = False
+    print("⚠️  未安装 WeasyPrint，将无法生成 PDF。请运行: pip install weasyprint")
+
 
 # ============================================================
 #  配置加载
@@ -80,271 +98,6 @@ def call_api(endpoint, payload=None):
         return {"code": -1, "msg": "返回非 JSON 格式"}
     except Exception as e:
         return {"code": -1, "msg": str(e)}
-
-
-# ============================================================
-#  Word 辅助函数
-# ============================================================
-def _set_no_border(table):
-    """移除表格所有边框（彻底隐藏）"""
-    tbl = table._tbl
-    tblPr = tbl.tblPr if tbl.tblPr is not None else parse_xml(f'<w:tblPr {nsdecls("w")}/>')
-    # 先移除已有边框
-    existing = tblPr.findall(qn('w:tblBorders'))
-    for e in existing:
-        tblPr.remove(e)
-    borders = parse_xml(
-        f'<w:tblBorders {nsdecls("w")}>'
-        '  <w:top w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
-        '  <w:left w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
-        '  <w:bottom w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
-        '  <w:right w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
-        '  <w:insideH w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
-        '  <w:insideV w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
-        '</w:tblBorders>'
-    )
-    tblPr.append(borders)
-
-
-def _set_hidden_cell_borders(cell):
-    """隐藏单单元格的所有边框"""
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    # 移除旧边框
-    existing = tcPr.findall(qn('w:tcBorders'))
-    for e in existing:
-        tcPr.remove(e)
-    tcBorders = parse_xml(
-        f'<w:tcBorders {nsdecls("w")}>'
-        '  <w:top w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
-        '  <w:left w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
-        '  <w:bottom w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
-        '  <w:right w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
-        '</w:tcBorders>'
-    )
-    tcPr.append(tcBorders)
-
-
-def _create_hidden_question_cell(doc):
-    """创建一个包裹单道题目的无边框表格单元格（允许跨页断行）"""
-    table = doc.add_table(rows=1, cols=1)
-    _set_no_border(table)
-    table.rows[0].allow_break_across_pages = True
-    cell = table.cell(0, 0)
-    _set_hidden_cell_borders(cell)
-    return cell
-
-
-def _add_footer(section, footer_text):
-    """添加页脚（居中、小字）"""
-    footer = section.footer
-    footer.is_linked_to_previous = False
-    fp = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
-    fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    fp.paragraph_format.space_before = Pt(0)
-    fp.paragraph_format.space_after = Pt(0)
-    fr = fp.add_run(footer_text)
-    fr.font.size = Pt(9)
-    fr.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
-    fr.font.name = "微软雅黑"
-    fr._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
-
-
-# ============================================================
-#  智能图片宽度计算
-# ============================================================
-def get_image_display_width(phys_path, max_width_cm=15.8, dpi=130):
-    """
-    根据图片纵横比自动计算 Word 中显示宽度。
-    Ratio > 2.0  → 通栏大图 (A4 全宽)            → 15.8 cm
-    Ratio 1.3 ~ 2.0 → 宽幅半栏                    → 11.0 cm
-    Ratio < 1.3  → 标准半栏 / 竖图 (半栏截图)     →  8.5 cm
-    参考 DPI = 130，防止低分辨率图被强行拉大。
-    """
-    if not _HAS_PIL or not phys_path or not os.path.isfile(phys_path):
-        return Cm(max_width_cm)
-    try:
-        with Image.open(phys_path) as img:
-            w_px, h_px = img.size
-    except Exception:
-        return Cm(max_width_cm)
-
-    ratio = w_px / h_px if h_px > 0 else 1.0
-    # 防低分辨率拉伸：W * 2.54 / dpi
-    w_cm = w_px * 2.54 / dpi
-
-    if ratio > 2.0:
-        # 通栏大图
-        desired = min(15.8, w_cm)
-    elif ratio >= 1.3:
-        # 宽幅半栏
-        desired = min(11.0, w_cm)
-    else:
-        # 标准半栏 / 竖图
-        desired = min(8.5, w_cm)
-
-    # 确保不超过绝对最大宽度
-    desired = min(max_width_cm, desired)
-
-    print(f"  DEBUG: 图片尺寸 {w_px}x{h_px}, 比例 {ratio:.2f}, 计算后的 Word 宽度: {desired:.2f}cm")
-    return Cm(desired)
-
-
-# ============================================================
-#  双栏并排辅助函数
-# ============================================================
-def is_compact_item(item):
-    """
-    判断题目是否为"小型题"（适合并排摆放）。
-    标准：所有图片都是 Type 3 (Ratio < 1.3) 且文本行数 < 5。
-    """
-    text = item[4] if len(item) > 4 else ""
-    images = item[5] if len(item) > 5 else []
-
-    # 文本行数估算
-    text_lines = len([l for l in text.split("\n") if l.strip()]) if text else 0
-    if text_lines >= 5:
-        return False
-
-    # 检查所有图片是否为 Type 3（需要 PIL）
-    if not _HAS_PIL or not images:
-        # 无图片或没有 PIL：文本少就算紧凑
-        return True
-
-    for img_path in images:
-        phys = map_image_path(img_path)
-        if phys is None or not os.path.isfile(phys):
-            continue
-        try:
-            with Image.open(phys) as img:
-                w_px, h_px = img.size
-            ratio = w_px / h_px if h_px > 0 else 1.0
-            if ratio >= 1.3:
-                return False
-        except Exception:
-            continue
-
-    return True
-
-
-def _write_item_to_cell(cell_or_doc, item, idx, is_dual=False):
-    """
-    将一道题目写入文档或双栏表格单元格。
-    - 如果 cell_or_doc 是 Document（通栏模式）：直接向文档添加段落，不用表格包裹，允许自然跨页。
-    - 如果 cell_or_doc 是 Cell（双栏模式）：向已有单元格添加段落，保持 keep_with_next 以防止双栏内容跨页错乱。
-    idx: 题号（用于显示）
-    is_dual: 如果 True，图片宽度限制为 Cm(7.2) 以防双栏溢出。
-    """
-    doc_id, full_title, cat, score, text, images, answer_md = item
-    display_title = format_question_title(full_title)
-    has_image = bool(images)
-
-    # 判断 cell_or_doc 是单元格还是文档
-    is_cell = hasattr(cell_or_doc, 'add_table') is False  # 文档有 add_table，cell 没有
-
-    if is_cell:
-        # ======== 双栏模式：写入已有 Table Cell ========
-        cell = cell_or_doc
-        cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
-        cell_paragraphs = cell.paragraphs
-        cell_paragraphs[0].clear()
-        # 大题标题 —— 保留 keep_with_next，确保序号不孤立（双栏缩小字号）
-        h = cell_paragraphs[0]
-        h.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        h.paragraph_format.space_before = Pt(0)
-        h.paragraph_format.space_after = Pt(2)
-        h.paragraph_format.keep_with_next = True
-        run_h = h.add_run(f"{idx}. {display_title}")
-        run_h.bold = True
-        run_h.font.size = Pt(14)
-        run_h.font.name = "微软雅黑"
-        run_h._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
-
-        # 题目文本（不设 keep_with_next，允许自然跨页）
-        if text:
-            p = cell.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            p.paragraph_format.space_before = Pt(6)
-            p.paragraph_format.space_after = Pt(2)
-            rt = p.add_run(text)
-            rt.font.size = Pt(12)
-            rt.font.name = "宋体"
-            rt._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-
-        # 图片（不设 keep_with_next，允许自然跨页）
-        for img_path in images:
-            phys = map_image_path(img_path)
-            if phys is None:
-                continue
-            try:
-                pi = cell.add_paragraph()
-                pi.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                pi.paragraph_format.space_before = Pt(6)
-                pi.paragraph_format.space_after = Pt(2)
-                ri = pi.add_run()
-                max_w = 7.2 if is_dual else 15.8
-                width = get_image_display_width(phys, max_width_cm=max_w, dpi=130)
-                ri.add_picture(phys, width=width)
-            except Exception as e:
-                print(f"  ⚠️ 图片插入失败 [{img_path}]: {e}")
-
-        # 留白
-        if not has_image:
-            bp = cell.add_paragraph()
-            bp.paragraph_format.space_before = Pt(0)
-            bp.paragraph_format.space_after = Pt(2)
-            br = bp.add_run("")
-            br.font.size = Pt(6)
-
-    else:
-        # ======== 通栏模式：直接写入 Document（不用表格包裹）========
-        doc = cell_or_doc
-
-        # 大题标题 —— 保留 keep_with_next，确保序号不孤立
-        h = doc.add_paragraph()
-        h.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        h.paragraph_format.space_before = Pt(6)
-        h.paragraph_format.space_after = Pt(2)
-        h.paragraph_format.keep_with_next = True
-        run_h = h.add_run(f"{idx}. {display_title}")
-        run_h.bold = True
-        run_h.font.size = Pt(14)
-        run_h.font.name = "微软雅黑"
-        run_h._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
-
-        # 题目文本（不设 keep_with_next，允许自然跨页）
-        if text:
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            p.paragraph_format.space_before = Pt(6)
-            p.paragraph_format.space_after = Pt(2)
-            rt = p.add_run(text)
-            rt.font.size = Pt(12)
-            rt.font.name = "宋体"
-            rt._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-
-        # 图片（不设 keep_with_next，允许自然跨页）
-        for img_path in images:
-            phys = map_image_path(img_path)
-            if phys is None:
-                continue
-            try:
-                pi = doc.add_paragraph()
-                pi.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                pi.paragraph_format.space_before = Pt(6)
-                pi.paragraph_format.space_after = Pt(2)
-                ri = pi.add_run()
-                width = get_image_display_width(phys, max_width_cm=15.8, dpi=130)
-                ri.add_picture(phys, width=width)
-            except Exception as e:
-                print(f"  ⚠️ 图片插入失败 [{img_path}]: {e}")
-
-        # 留白（通栏模式在题目之间留一点空白）
-        bp = doc.add_paragraph()
-        bp.paragraph_format.space_before = Pt(0)
-        bp.paragraph_format.space_after = Pt(4)
-        br = bp.add_run("")
-        br.font.size = Pt(6)
 
 
 # ============================================================
@@ -509,7 +262,6 @@ def parse_score_table(md_source):
         return None
 
     # 1) 用 re.findall 抓取所有表格块
-    # 表格块：以 | 开头，空行结束的连续段落
     table_blocks = re.findall(r'^(?:\|.*\n?)+', md_source, re.MULTILINE)
 
     # 2) 找到包含"总积分"的表格
@@ -528,10 +280,8 @@ def parse_score_table(md_source):
     # 4) 从最后一行向上寻找数据行（跳过分隔行和空行）
     data_line = None
     for line in reversed(lines):
-        # 跳过纯分隔行
         if re.match(r'^[\s\|:\-]+$', line) and "---" in line:
             continue
-        # 跳过太短的行
         if line.count("|") < 2:
             continue
         data_line = line
@@ -540,12 +290,10 @@ def parse_score_table(md_source):
     if data_line is None:
         return None
 
-    # 调试：打印原始行
     print(f"  [DEBUG] 识别到的最后一行: {data_line}")
 
     # 5) 按 | 分割，取最后一个非空元素
     parts = [p.strip() for p in data_line.split("|")]
-    # 过滤空字符串
     non_empty = [p for p in parts if p]
     if not non_empty:
         return None
@@ -611,11 +359,8 @@ def parse_question(md_source):
     # 再清理 {:...} 和提取文字
     text_parts = []
     for line in content_lines:
-        # 清理 {: id="..."}
         s = re.sub(r'\{:\s*[^}]*\}', '', line).strip()
-        # 去掉开头的 >
         s = re.sub(r'^>\s*', '', s)
-        # 清理行内图片标记和 [图片] 占位
         s = re.sub(r'!\[.*?\]\([^)]+\)', '', s)
         s = re.sub(r'\s*\[图片\]\s*', '', s)
         if s.strip():
@@ -646,7 +391,7 @@ def parse_answer(md_source):
 
     raw_lines = md_source.split("\n")
 
-    # 定位 ## 答案（兼容各种写法：## 答案、## 💡 答案、##💡答案等）
+    # 定位 ## 答案（兼容各种写法）
     start_idx = -1
     for i, line in enumerate(raw_lines):
         s = line.strip()
@@ -662,7 +407,6 @@ def parse_answer(md_source):
     for line in raw_lines[start_idx + 1:]:
         s = line.strip()
         if s.startswith("##"):
-            # 如果是 "## 扩展题目"，结束；其他二级标题也结束
             break
         content_lines.append(line)
 
@@ -678,11 +422,8 @@ def parse_answer(md_source):
     # 再清理 {:...} 和提取文字
     text_parts = []
     for line in content_lines:
-        # 清理 {: id="..."}
         s = re.sub(r'\{:\s*[^}]*\}', '', line).strip()
-        # 去掉开头的 >
         s = re.sub(r'^>\s*', '', s)
-        # 清理行内图片标记和 [图片] 占位
         s = re.sub(r'!\[.*?\]\([^)]+\)', '', s)
         s = re.sub(r'\s*\[图片\]\s*', '', s)
         if s.strip():
@@ -692,7 +433,6 @@ def parse_answer(md_source):
     text = re.sub(r'\s*\[图片\]\s*', '', text)
 
     if not text and not image_paths:
-        # 调试：打印原始 Kramdown 前 100 字符
         print(f"  [DEBUG] parse_answer 提取为空，原始 Kramdown 前 100 字符:")
         print(f"  [DEBUG] {md_source[:100]!r}")
         return None
@@ -760,7 +500,7 @@ def estimate_lines(item):
     title_lines = 1
     text_lines = max(1, math.ceil(len(text) / 50))
     image_lines = len(images) * 12
-    blank_lines = 1  # 统一减少 30%+
+    blank_lines = 1
     return title_lines + text_lines + image_lines + blank_lines
 
 
@@ -770,6 +510,40 @@ def estimate_total_pages(items):
     total_lines = sum(estimate_lines(it) for it in items)
     lines_per_page = 50
     return max(1, math.ceil(total_lines / lines_per_page))
+
+
+# ============================================================
+#  紧凑题目判断
+# ============================================================
+def is_compact_item(item):
+    """
+    判断题目是否为"小型题"（适合并排摆放）。
+    标准：所有图片都是 Type 3 (Ratio < 1.3) 且文本行数 < 5。
+    """
+    text = item[4] if len(item) > 4 else ""
+    images = item[5] if len(item) > 5 else []
+
+    text_lines = len([l for l in text.split("\n") if l.strip()]) if text else 0
+    if text_lines >= 5:
+        return False
+
+    if not _HAS_PIL or not images:
+        return True
+
+    for img_path in images:
+        phys = map_image_path(img_path)
+        if phys is None or not os.path.isfile(phys):
+            continue
+        try:
+            with Image.open(phys) as img:
+                w_px, h_px = img.size
+            ratio = w_px / h_px if h_px > 0 else 1.0
+            if ratio >= 1.3:
+                return False
+        except Exception:
+            continue
+
+    return True
 
 
 # ============================================================
@@ -807,7 +581,6 @@ def select_questions(all_docs):
         md = get_block_kramdown(doc_id)
         parsed = parse_question(md) if md else None
         if parsed:
-            # 额外保存原始 md 给答案卷用
             return (doc_id, title, cat, score, parsed["text"], parsed["images"], md)
         return None
 
@@ -840,7 +613,6 @@ def select_questions(all_docs):
                 selected.append(item)
                 print(f"   ➕ 补充: {shorten_title(d[1])} (积分: {d[3]})")
     elif current_pages < MIN_PAGES:
-        # ⚠️ 黄色警告：页数不足且无困难题可补
         yellow = "\033[93m"
         reset = "\033[0m"
         print(f"\n{yellow}{'⚠️ ' * 10}")
@@ -855,159 +627,296 @@ def select_questions(all_docs):
 
 
 # ============================================================
-#  Word 导出 —— 练习卷
+#  HTML 工具函数
 # ============================================================
-def _lines_remaining_in_page(doc):
+def _html_image_tag(api_image_path, max_width="100%"):
     """
-    估算当前页面剩余行数。
-    基于文档当前段落数、表格数进行粗略估算。
-    标准 A4 页面（上下边距各 1.27cm）可用行数约 45 行。
+    将思源 API 图片路径转换为 HTML <img> 标签。
+    返回空字符串如果图片文件不存在。
     """
-    # 保守估算每行高度约 0.55cm (14pt 字体)
-    # 可用高度: 29.7 - 1.27*2 = 27.16cm
-    # 可用行数 ≈ 27.16 / 0.55 ≈ 49 行
-    max_lines = 48
-
-    # 估算已使用行数：每个段落算 1 行基线 + 额外行数
-    used_lines = 1  # 标题
-    for p in doc.paragraphs:
-        text = p.text
-        if text:
-            used_lines += max(1, math.ceil(len(text) / 50))
-
-    # 估算表格行数
-    for table in doc.tables:
-        for row in table.rows:
-            # 每行表格算 2 行基线，加上单元格文字
-            used_lines += 2
-            for cell in row.cells:
-                for p in cell.paragraphs:
-                    if p.text:
-                        used_lines += max(1, math.ceil(len(p.text) / 40))
-
-    remaining = max_lines - used_lines
-    return max(0, remaining)
+    phys = map_image_path(api_image_path)
+    if phys is None:
+        return ""
+    abs_path = os.path.abspath(phys)
+    # 使用 file:// 协议嵌入本地图片，URL-encode 路径中的特殊字符（中文、空格等）
+    abs_path_encoded = urllib.parse.quote(abs_path, safe='/:@!*()')
+    return f'<img src="file://{abs_path_encoded}" style="max-width: {max_width}; max-height: 80vh; object-fit: contain; display: block; margin: 4px auto;" />'
 
 
-def create_practice_doc(selected_items, current_time_str, target_folders_str):
-    doc = Document()
+def _html_escape(text):
+    """转义 HTML 特殊字符（使用标准库 html.escape）。"""
+    if not text:
+        return ""
+    return html.escape(text, quote=True)
 
-    # ---------- 页面设置 ----------
-    sec = doc.sections[0]
-    sec.page_width = Cm(21.0)
-    sec.page_height = Cm(29.7)
-    sec.top_margin = Cm(1.27)
-    sec.bottom_margin = Cm(1.27)
-    sec.left_margin = Cm(1.27)
-    sec.right_margin = Cm(1.27)
 
-    # ---------- 页脚 ----------
-    footer_text = f"范围：{target_folders_str} | 生成时间：{current_time_str}"
-    _add_footer(sec, footer_text)
+def _html_build_question_body(item, idx):
+    """
+    构建单道题目的 HTML 内容字符串（不含外层容器标签）。
+    返回 (html_content, has_images) 元组。
+    """
+    doc_id, full_title, cat, score, text, images, answer_md = item
+    display_title = format_question_title(full_title)
+    parts = []
 
-    # ---------- 卷头标题 ----------
-    tp = doc.add_paragraph()
-    tp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    tp.paragraph_format.space_before = Pt(6)
-    tp.paragraph_format.space_after = Pt(12)
-    r = tp.add_run(f"今日练习 {current_time_str[:10]}")
-    r.bold = True
-    r.font.size = Pt(16)
-    r.font.name = "微软雅黑"
-    r._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+    # 标题
+    parts.append(f'<div class="q-title">{idx}. {_html_escape(display_title)}</div>')
 
-    # ---------- 遍历 + 双栏并排 ----------
-    buffer = []   # 暂存小型题
-    global_idx = 0
+    # 题目文本
+    if text:
+        for para in text.split("\n"):
+            para = para.strip()
+            if para:
+                parts.append(f'<div class="q-text">{_html_escape(para)}</div>')
+
+    # 图片
+    has_images = bool(images)
+    for img_path in images:
+        tag = _html_image_tag(img_path)
+        if tag:
+            parts.append(f'<div class="q-image">{tag}</div>')
+
+    return "\n".join(parts), has_images
+
+
+# ============================================================
+#  HTML 源码生成器 —— 练习卷（重写版）
+# ============================================================
+def generate_html_practice(selected_items, current_time_str, target_folders_str):
+    """
+    生成 HTML 练习卷源码字符串。
+    使用 CSS Grid 双栏布局 + 通栏排版，保持原始题目顺序。
+
+    排版策略：
+    - 按原始顺序遍历题目，保持题号连续
+    - 紧凑型（compact）题目两两配对放入 CSS Grid 双栏容器
+    - 常规型（normal）题目通栏排版
+    - 每道题目的容器使用 break-inside: avoid 防止跨页截断
+    - 相比上一版的改进：不再将所有 compact/normal 分组，而是保持自然顺序
+    """
+    date_str = current_time_str[:10]
+
+    # 构建 CSS
+    css = f"""
+    @page {{
+        size: A4;
+        margin: 10mm;
+        @bottom-center {{
+            content: "{_html_escape(target_folders_str)} | {_html_escape(current_time_str)}";
+            font-size: 9pt;
+            color: #666;
+        }}
+    }}
+    * {{
+        box-sizing: border-box;
+    }}
+    body {{
+        font-family: "Noto Sans CJK SC", "WenQuanYi Micro Hei", "Microsoft YaHei", "微软雅黑", "STHeiti", sans-serif;
+        font-size: 11pt;
+        line-height: 1.6;
+        color: #222;
+    }}
+    .header {{
+        text-align: center;
+        font-size: 16pt;
+        font-weight: bold;
+        font-family: "Noto Sans CJK SC", "WenQuanYi Micro Hei", "Microsoft YaHei", "微软雅黑", "STHeiti", sans-serif;
+        margin-bottom: 10mm;
+        padding-bottom: 5mm;
+        border-bottom: 2px solid #333;
+    }}
+    /* 双栏网格行 — 每行 contain 两道紧凑题 */
+    .grid-row {{
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6mm;
+        margin-bottom: 4mm;
+        page-break-inside: avoid;
+        break-inside: avoid;
+    }}
+    /* 通栏题目 */
+    .full-width {{
+        width: 100%;
+        margin-bottom: 4mm;
+    }}
+    /* 单道题目的容器 — break-inside: avoid 防跨页 */
+    .question-card {{
+        break-inside: avoid;
+        page-break-inside: avoid;
+        padding: 2mm 3mm;
+        border: 1px solid #ddd;
+        border-radius: 2mm;
+        background: #fafafa;
+        /* 用 min-height 确保卡片不会收缩到 0 高度 */
+        min-height: 20mm;
+    }}
+    .question-card .q-title {{
+        font-weight: bold;
+        font-size: 12pt;
+        font-family: "Noto Sans CJK SC", "WenQuanYi Micro Hei", "Microsoft YaHei", "微软雅黑", "STHeiti", sans-serif;
+        margin-bottom: 2mm;
+    }}
+    .question-card .q-text {{
+        margin-bottom: 1mm;
+        white-space: pre-wrap;
+    }}
+    .question-card .q-image {{
+        text-align: center;
+        margin: 2mm 0;
+    }}
+    .question-card .q-image img {{
+        max-width: 100%;
+        max-height: 80vh;
+        object-fit: contain;
+    }}
+    @media print {{
+        .question-card {{
+            break-inside: avoid;
+            page-break-inside: avoid;
+        }}
+    }}
+    """
+
+    # 第一步：判断每道题的紧凑性（保留原始顺序）
+    item_types = []  # (item, is_compact)
     for item in selected_items:
-        global_idx += 1
-        if is_compact_item(item):
-            # 小型题 → 加入 buffer
-            buffer.append((global_idx, item))
-            if len(buffer) == 2:
-                # 集齐两道：创建 1 行 2 列无边框表格（严禁跨页，保持双栏左右对齐）
-                dual_table = doc.add_table(rows=1, cols=2)
-                dual_table.rows[0].allow_break_across_pages = False
-                _set_no_border(dual_table)
-                left_cell = dual_table.cell(0, 0)
-                right_cell = dual_table.cell(0, 1)
-                _set_hidden_cell_borders(left_cell)
-                _set_hidden_cell_borders(right_cell)
-                # 设置列宽为固定相等值
-                left_cell.width = Cm(9.5)
-                right_cell.width = Cm(9.5)
+        item_types.append((item, is_compact_item(item)))
 
-                idx1, item1 = buffer[0]
-                idx2, item2 = buffer[1]
-                _write_item_to_cell(left_cell, item1, idx1, is_dual=True)
-                _write_item_to_cell(right_cell, item2, idx2, is_dual=True)
+    # 第二步：构建 body
+    body_parts = []
+    body_parts.append(f'<div class="header">今日练习 {date_str}</div>')
 
-                # 双栏间加浅灰色分隔竖线
-                tc_pr_left = left_cell._tc.get_or_add_tcPr()
-                existing_left = tc_pr_left.findall(qn('w:tcBorders'))
-                for e in existing_left:
-                    tc_pr_left.remove(e)
-                borders_left = parse_xml(
-                    f'<w:tcBorders {nsdecls("w")}>'
-                    '  <w:top w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
-                    '  <w:left w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
-                    '  <w:bottom w:val="none" w:sz="0" w:space="0" w:color="FFFFFF"/>'
-                    '  <w:right w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/>'
-                    '</w:tcBorders>'
+    idx = 0
+    i = 0
+    while i < len(item_types):
+        item, is_compact = item_types[i]
+
+        if is_compact:
+            # 紧凑型：尝试两两配对成一行
+            # 检查下一个是否也是紧凑型
+            if i + 1 < len(item_types) and item_types[i + 1][1]:
+                # 两个紧凑题配对
+                item1, _ = item_types[i]
+                item2, _ = item_types[i + 1]
+                idx += 1
+                html1, _ = _html_build_question_body(item1, idx)
+                idx += 1
+                html2, _ = _html_build_question_body(item2, idx)
+                body_parts.append(
+                    f'<div class="grid-row">'
+                    f'<div class="question-card">{html1}</div>'
+                    f'<div class="question-card">{html2}</div>'
+                    f'</div>'
                 )
-                tc_pr_left.append(borders_left)
-
-                buffer = []
+                i += 2
+            else:
+                # 单个紧凑题单独占一行（通栏显示）
+                idx += 1
+                html_body, _ = _html_build_question_body(item, idx)
+                body_parts.append(f'<div class="full-width"><div class="question-card">{html_body}</div></div>')
+                i += 1
         else:
-            # 大型题（通栏）→ 先 flush buffer
-            for buf_idx, buf_item in buffer:
-                _write_item_to_cell(doc, buf_item, buf_idx, is_dual=False)
-            buffer = []
+            # 常规型：通栏
+            idx += 1
+            html_body, _ = _html_build_question_body(item, idx)
+            body_parts.append(f'<div class="full-width"><div class="question-card">{html_body}</div></div>')
+            i += 1
 
-            # 通栏题目允许自然跨页，不做强制换页判断
-            _write_item_to_cell(doc, item, global_idx, is_dual=False)
+    html_body_str = "\n".join(body_parts)
 
-    # 收尾：buffer 中最后一道题（通栏写入，允许自然跨页）
-    for buf_idx, buf_item in buffer:
-        _write_item_to_cell(doc, buf_item, buf_idx, is_dual=False)
-
-    return doc
+    html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>{css}</style>
+</head>
+<body>
+{html_body_str}
+</body>
+</html>"""
+    return html
 
 
 # ============================================================
-#  Word 导出 —— 答案卷（无隐藏表格，自然跨页）
+#  HTML 源码生成器 —— 答案卷（重写版）
 # ============================================================
-def create_answer_doc(selected_items, current_time_str, target_folders_str):
-    doc = Document()
+def generate_html_answer(selected_items, current_time_str, target_folders_str):
+    """
+    生成 HTML 答案卷源码字符串。
+    通栏排版，每道题显示序号 + 答案内容 + 答案图片。
+    使用 break-inside: avoid 防止单个答案跨页。
+    """
+    date_str = current_time_str[:10]
 
-    # ---------- 页面设置 ----------
-    sec = doc.sections[0]
-    sec.page_width = Cm(21.0)
-    sec.page_height = Cm(29.7)
-    sec.top_margin = Cm(1.27)
-    sec.bottom_margin = Cm(1.27)
-    sec.left_margin = Cm(1.27)
-    sec.right_margin = Cm(1.27)
+    css = f"""
+    @page {{
+        size: A4;
+        margin: 10mm;
+        @bottom-center {{
+            content: "答案 | {_html_escape(target_folders_str)} | {_html_escape(current_time_str)}";
+            font-size: 9pt;
+            color: #666;
+        }}
+    }}
+    * {{
+        box-sizing: border-box;
+    }}
+    body {{
+        font-family: "Noto Sans CJK SC", "WenQuanYi Micro Hei", "Microsoft YaHei", "微软雅黑", "STHeiti", sans-serif;
+        font-size: 11pt;
+        line-height: 1.6;
+        color: #222;
+    }}
+    .header {{
+        text-align: center;
+        font-size: 16pt;
+        font-weight: bold;
+        font-family: "Noto Sans CJK SC", "WenQuanYi Micro Hei", "Microsoft YaHei", "微软雅黑", "STHeiti", sans-serif;
+        margin-bottom: 10mm;
+        padding-bottom: 5mm;
+        border-bottom: 2px solid #333;
+    }}
+    .answer-card {{
+        break-inside: avoid;
+        page-break-inside: avoid;
+        padding: 3mm 4mm;
+        margin-bottom: 4mm;
+        border: 1px solid #ccc;
+        border-radius: 2mm;
+        background: #f5f5f5;
+    }}
+    .answer-card .a-title {{
+        font-weight: bold;
+        font-size: 11pt;
+        margin-bottom: 2mm;
+        color: #c00;
+    }}
+    .answer-card .a-text {{
+        margin-bottom: 1mm;
+        white-space: pre-wrap;
+    }}
+    .answer-card .a-image {{
+        text-align: center;
+        margin: 2mm 0;
+    }}
+    .answer-card .a-image img {{
+        max-width: 70%;
+        max-height: 80vh;
+        object-fit: contain;
+    }}
+    @media print {{
+        .answer-card {{
+            break-inside: avoid;
+            page-break-inside: avoid;
+        }}
+    }}
+    """
 
-    # ---------- 页脚 ----------
-    footer_text = f"范围：{target_folders_str} | 生成时间：{current_time_str}"
-    _add_footer(sec, footer_text)
+    body_parts = []
+    body_parts.append(f'<div class="header">【答案】今日练习 {date_str}</div>')
 
-    # ---------- 卷头标题 ----------
-    tp = doc.add_paragraph()
-    tp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    tp.paragraph_format.space_before = Pt(6)
-    tp.paragraph_format.space_after = Pt(12)
-    r = tp.add_run(f"【答案】今日练习 {current_time_str[:10]}")
-    r.bold = True
-    r.font.size = Pt(16)
-    r.font.name = "微软雅黑"
-    r._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
-
-    # ---------- 遍历每道题（直接写在文档主体中，允许自然跨页）----------
     for idx, item in enumerate(selected_items, 1):
         doc_id, full_title, cat, score, text, images, answer_md = item
-
         display_title = format_question_title(full_title)
 
         # 解析答案
@@ -1015,52 +924,64 @@ def create_answer_doc(selected_items, current_time_str, target_folders_str):
         answer_text = answer_data["text"] if answer_data else ""
         answer_images = answer_data["images"] if answer_data else []
 
-        # 答案标题（直接添加到文档）
-        h = doc.add_paragraph()
-        h.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        run_h = h.add_run(f"{idx}. 【答案】{display_title}")
-        run_h.bold = True
-        run_h.font.size = Pt(12)
-        run_h.font.name = "微软雅黑"
-        run_h._element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+        card_parts = []
+        card_parts.append(f'<div class="a-title">{idx}. 【答案】{_html_escape(display_title)}</div>')
 
-        # 答案文字（左对齐，间距紧凑）
         if answer_text:
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            p.paragraph_format.space_before = Pt(2)
-            p.paragraph_format.space_after = Pt(2)
-            rt = p.add_run(answer_text)
-            rt.font.size = Pt(11)
-            rt.font.name = "宋体"
-            rt.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
-            rt._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+            for para in answer_text.split("\n"):
+                para = para.strip()
+                if para:
+                    card_parts.append(f'<div class="a-text">{_html_escape(para)}</div>')
 
-        # 答案图片（智能纵横比缩放，绝对最大宽度 Cm(10) 以确保紧凑排版）
         for img_path in answer_images:
-            phys = map_image_path(img_path)
-            if phys is None:
-                continue
-            try:
-                pi = doc.add_paragraph()
-                pi.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                pi.paragraph_format.space_before = Pt(2)
-                pi.paragraph_format.space_after = Pt(2)
-                ri = pi.add_run()
-                width = get_image_display_width(phys, max_width_cm=10.0, dpi=130)
-                ri.add_picture(phys, width=width)
-            except Exception as e:
-                print(f"  ⚠️ 答案图片插入失败 [{img_path}]: {e}")
+            tag = _html_image_tag(img_path, max_width="70%")
+            if tag:
+                card_parts.append(f'<div class="a-image">{tag}</div>')
 
-        # 紧凑排版：题目之间空半行
-        if idx < len(selected_items):
-            gap = doc.add_paragraph()
-            gap.paragraph_format.space_before = Pt(0)
-            gap.paragraph_format.space_after = Pt(4)
-            gr = gap.add_run("")
-            gr.font.size = Pt(12)
+        body_parts.append(f'<div class="answer-card">{"".join(card_parts)}</div>')
 
-    return doc
+    html_body_str = "\n".join(body_parts)
+
+    html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>{css}</style>
+</head>
+<body>
+{html_body_str}
+</body>
+</html>"""
+    return html
+
+
+# ============================================================
+#  HTML → PDF 编译函数（使用 WeasyPrint）
+# ============================================================
+def compile_html_to_pdf(html_content, output_pdf_path):
+    """
+    将 HTML 字符串通过 WeasyPrint 编译为 PDF 文件。
+
+    参数：
+      html_content  : str - 完整的 HTML 源码（含 <!DOCTYPE html>）
+      output_pdf_path: str - 输出的 PDF 文件路径
+
+    返回：
+      (success: bool, message: str)
+    """
+    if not _HAS_WEASYPRINT:
+        return False, "❌ WeasyPrint 未安装。请运行: pip install weasyprint"
+
+    try:
+        # 使用 FontConfiguration 确保 WeasyPrint 能找到系统字体（尤其是 Windows）
+        font_config = FontConfiguration()
+        HTML(string=html_content).write_pdf(
+            output_pdf_path,
+            font_config=font_config
+        )
+        return True, f"✅ PDF 生成成功: {output_pdf_path}"
+    except Exception as e:
+        return False, f"❌ PDF 生成失败: {e}"
 
 
 # ============================================================
@@ -1071,13 +992,13 @@ def main():
     current_time_str = now.strftime('%Y-%m-%d %H:%M')
     file_time_str = now.strftime('%Y%m%d_%H%M')
 
-    practice_filename = f"今日练习_{file_time_str}.docx"
-    answer_filename = f"今日练习_答案_{file_time_str}.docx"
+    practice_pdf = f"今日练习_{file_time_str}.pdf"
+    answer_pdf = f"今日练习_答案_{file_time_str}.pdf"
 
     target_folders_str = ", ".join(TARGET_FOLDERS)
 
     print("=" * 60)
-    print("📋 思源笔记 —— 错题拼卷机")
+    print("📋 思源笔记 —— 错题拼卷机 (HTML + WeasyPrint 版)")
     print("=" * 60)
 
     print(f"\n🎯 当前选题范围: {TARGET_FOLDERS}")
@@ -1133,39 +1054,36 @@ def main():
 
     selected = select_questions(all_docs)
 
-    # 智能高度排序：将小型题按高度升序排列，利于双栏完美结对
-    compact_items = [item for item in selected if is_compact_item(item)]
-    normal_items = [item for item in selected if not is_compact_item(item)]
-    compact_items.sort(key=lambda x: estimate_lines(x))
-    selected = compact_items + normal_items
-
     if not selected:
         print("\n❌ 没有符合选题条件的题目。")
         return
 
-    # 4) 生成练习卷
+    # 4) 生成练习卷 HTML → PDF
     print(f"\n{'=' * 60}")
-    print(f"📦 正在生成练习卷 ({len(selected)} 道大题)……")
-    practice_doc = create_practice_doc(selected, current_time_str, target_folders_str)
+    print(f"📦 正在生成练习卷 HTML ({len(selected)} 道大题)……")
+    practice_html = generate_html_practice(selected, current_time_str, target_folders_str)
 
-    practice_path = os.path.abspath(practice_filename)
-    practice_doc.save(practice_path)
-    print(f"\n✅ 练习卷已保存: {practice_path}")
+    print(f"   ⏳ 正在编译练习卷 PDF……")
+    success, msg = compile_html_to_pdf(practice_html, practice_pdf)
+    print(f"   {msg}")
 
-    # 5) 生成答案卷
-    print(f"\n📦 正在生成答案卷 ({len(selected)} 道)……")
-    answer_doc = create_answer_doc(selected, current_time_str, target_folders_str)
+    # 5) 生成答案卷 HTML → PDF
+    print(f"\n📦 正在生成答案卷 HTML ({len(selected)} 道)……")
+    answer_html = generate_html_answer(selected, current_time_str, target_folders_str)
 
-    answer_path = os.path.abspath(answer_filename)
-    answer_doc.save(answer_path)
-    print(f"\n✅ 答案卷已保存: {answer_path}")
+    print(f"   ⏳ 正在编译答案卷 PDF……")
+    success2, msg2 = compile_html_to_pdf(answer_html, answer_pdf)
+    print(f"   {msg2}")
 
+    # 6) 统计
     print(f"\n{'=' * 60}")
     print(f"📊 统计")
     print(f"   共 {len(selected)} 道大题")
-    print(f"   练习卷: {practice_filename}")
-    print(f"   答案卷: {answer_filename}")
+    print(f"   练习卷: {practice_pdf}")
+    print(f"   答案卷: {answer_pdf}")
     print(f"   估算 ~{estimate_total_pages(selected)} 页 (A4)")
+    if not success or not success2:
+        print(f"\n⚠️  部分 PDF 文件编译失败，请检查上述错误信息。")
     print(f"{'=' * 60}")
 
 
