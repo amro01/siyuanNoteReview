@@ -692,9 +692,9 @@ def _html_build_question_body(item, idx, is_compact=False):
             para = para.strip()
             if para:
                 text_lines += math.ceil(len(para) / chars_per_line)
-        spacer_lines = max(3, text_lines + 3)
-        spacer_height = spacer_lines * 30
-        parts.append(f'<div class="q-spacer" style="min-height: {spacer_height}px; width: 100%;"></div>')
+        spacer_lines = max(2, math.ceil(text_lines * 0.4) + 1)
+        spacer_height = spacer_lines * 25
+        parts.append(f'<div class="q-spacer" style="height: {spacer_height}px; width: 100%; display: block; color: transparent;">&nbsp;</div>')
 
     return "\n".join(parts), has_images
 
@@ -745,8 +745,8 @@ def generate_html_practice(selected_items, current_time_str, target_folders_str)
         padding-bottom: 5mm;
         border-bottom: 2px solid #333;
     }}
-    /* 双栏网格行 — 每行 contain 两道紧凑题 */
-    .grid-row {{
+    /* Grid 网格组 — 包裹连续紧凑题 */
+    .compact-grid {{
         display: grid;
         grid-template-columns: 1fr 1fr;
         gap: 6mm;
@@ -796,50 +796,42 @@ def generate_html_practice(selected_items, current_time_str, target_folders_str)
     }}
     """
 
-    # 第一步：判断每道题的紧凑性（保留原始顺序）
-    item_types = []  # (item, is_compact)
-    for item in selected_items:
-        item_types.append((item, is_compact_item(item)))
-
-    # 第二步：构建 body
+    # 构建 body
     body_parts = []
     body_parts.append(f'<div class="header">今日练习 {date_str}</div>')
 
-    idx = 0
-    i = 0
-    while i < len(item_types):
-        item, is_compact = item_types[i]
+    grid_buffer = []
+
+    def flush_grid():
+        if not grid_buffer:
+            return
+        if len(grid_buffer) == 1:
+            # 只有1个半栏题时，直接转为通栏，避免右侧全空
+            body_parts.append(f'<div class="full-width">{grid_buffer[0]}</div>')
+        else:
+            body_parts.append('<div class="compact-grid">')
+            for card in grid_buffer:
+                body_parts.append(card)
+            body_parts.append('</div>')
+        grid_buffer.clear()
+
+    idx = 1
+    for item in selected_items:
+        is_compact = is_compact_item(item)
+        html_body, _ = _html_build_question_body(item, idx, is_compact=is_compact)
 
         if is_compact:
-            # 紧凑型：尝试两两配对成一行
-            # 检查下一个是否也是紧凑型
-            if i + 1 < len(item_types) and item_types[i + 1][1]:
-                # 两个紧凑题配对
-                item1, _ = item_types[i]
-                item2, _ = item_types[i + 1]
-                idx += 1
-                html1, _ = _html_build_question_body(item1, idx, is_compact=True)
-                idx += 1
-                html2, _ = _html_build_question_body(item2, idx, is_compact=True)
-                body_parts.append(
-                    f'<div class="grid-row">'
-                    f'<div class="question-card">{html1}</div>'
-                    f'<div class="question-card">{html2}</div>'
-                    f'</div>'
-                )
-                i += 2
-            else:
-                # 单个紧凑题单独占一行（通栏显示）
-                idx += 1
-                html_body, _ = _html_build_question_body(item, idx, is_compact=True)
-                body_parts.append(f'<div class="full-width"><div class="question-card">{html_body}</div></div>')
-                i += 1
+            # 收集连续的半栏题目
+            grid_buffer.append(f'<div class="question-card">{html_body}</div>')
         else:
-            # 常规型：通栏
-            idx += 1
-            html_body, _ = _html_build_question_body(item, idx, is_compact=False)
+            # 遇到通栏题目时，先清空输出之前的半栏网格
+            flush_grid()
             body_parts.append(f'<div class="full-width"><div class="question-card">{html_body}</div></div>')
-            i += 1
+
+        idx += 1
+
+    # 循环结束后，清空最后剩余的半栏网格
+    flush_grid()
 
     html_body_str = "\n".join(body_parts)
 
