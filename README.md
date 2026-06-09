@@ -19,7 +19,7 @@
 | 🖼️ 图片保留 | 自动映射思源笔记资产目录下的图片，嵌入到题文中 |
 | 📐 页数估算 | 基于文字量和图片数估算最终页数，确保练习卷容量合理 |
 | 🎨 双栏排版 | 小尺寸题目自动并排显示，大幅节省纸张 |
-| 🐧 Linux 友好 | CSS 字体回退优先使用 Linux 开源字体（Noto Sans CJK SC / WenQuanYi Micro Hei） |
+|  Linux 友好 | CSS 字体回退优先使用 Linux 开源字体（Noto Sans CJK SC / WenQuanYi Micro Hei） |
 
 ---
 
@@ -307,6 +307,22 @@ sudo dnf install google-noto-sans-cjk-fonts wqy-microhei-fonts
 
 ---
 
+## 🔧 变更记录
+
+| 版本 | 日期 | 变更 |
+|------|------|------|
+| v2.1 | 2026-06 | 新增多项增强功能 |
+
+### v2.1 变更详情
+
+- **去除 Kramdown 转义符**：在 `parse_question` 和 `parse_answer` 中使用 `re.sub(r'\\(.)', r'\1', text)` 全局清除反斜杠转义（`\_`、`\=`、`\*` 等），避免题目中残留多余反斜杠
+- **预留手写空间**：`_html_build_question_body` 新增 `is_compact` 参数，半栏题尾部预留 50px、通栏题预留 90px 空白 div，方便学生作答
+- **优化双栏排版**：移除 `.grid-row` 的 `break-inside: avoid` 规则，改用 `align-items: start` 避免 Grid 等高拉伸，减少底部大面积留白
+- **放宽紧凑型阈值**：`is_compact_item` 中的图片宽高比阈值从 1.3 提升至 1.7，使宽高比在 1.6 左右的图片正常使用半栏排版
+- **修复积分表解析**：重构 `parse_score_table`，改用 `parts[-2]` 定位积分列，跳过空行继续向上追溯，正则支持负数提取（如 `-1`）
+
+---
+
 ## 📋 项目结构
 
 ```
@@ -329,13 +345,13 @@ sudo dnf install google-noto-sans-cjk-fonts wqy-microhei-fonts
 | v2（当前） | **HTML + WeasyPrint** 生成 PDF，移除 Word 导出，清理死代码，修复 Linux 字体渲染 |
 
 **重构摘要：**
-- 🗑️ 移除 `generate_docx_report` 函数（~100 行）
+- �️ 移除 `generate_docx_report` 函数（~100 行）
 - 🗑️ 移除 `_extract_block_text_and_images` + `parse_full_content` 死代码
 - 🎨 CSS 字体回退策略优先 Linux 开源字体
 - 🧹 清理 docx 依赖导入和 main() 中冗余逻辑
 
 ---
 
-## 📄 许可
+## � 许可
 
 本项目仅供个人学习使用，请遵循思源笔记相关许可协议。

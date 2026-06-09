@@ -656,7 +656,7 @@ def _html_escape(text):
     return html.escape(text, quote=True)
 
 
-def _html_build_question_body(item, idx):
+def _html_build_question_body(item, idx, is_compact=False):
     """
     构建单道题目的 HTML 内容字符串（不含外层容器标签）。
     返回 (html_content, has_images) 元组。
@@ -682,8 +682,9 @@ def _html_build_question_body(item, idx):
         if tag:
             parts.append(f'<div class="q-image">{tag}</div>')
 
-    # 预留做题书写空间
-    parts.append('<div class="q-spacer" style="min-height: 80px; width: 100%;"></div>')
+    # 预留做题书写空间（半栏题 50px，通栏题 90px）
+    spacer_height = "50px" if is_compact else "90px"
+    parts.append(f'<div class="q-spacer" style="min-height: {spacer_height}; width: 100%;"></div>')
 
     return "\n".join(parts), has_images
 
@@ -740,8 +741,7 @@ def generate_html_practice(selected_items, current_time_str, target_folders_str)
         grid-template-columns: 1fr 1fr;
         gap: 6mm;
         margin-bottom: 4mm;
-        page-break-inside: avoid;
-        break-inside: avoid;
+        align-items: start;
     }}
     /* 通栏题目 */
     .full-width {{
@@ -808,9 +808,9 @@ def generate_html_practice(selected_items, current_time_str, target_folders_str)
                 item1, _ = item_types[i]
                 item2, _ = item_types[i + 1]
                 idx += 1
-                html1, _ = _html_build_question_body(item1, idx)
+                html1, _ = _html_build_question_body(item1, idx, is_compact=True)
                 idx += 1
-                html2, _ = _html_build_question_body(item2, idx)
+                html2, _ = _html_build_question_body(item2, idx, is_compact=True)
                 body_parts.append(
                     f'<div class="grid-row">'
                     f'<div class="question-card">{html1}</div>'
@@ -821,13 +821,13 @@ def generate_html_practice(selected_items, current_time_str, target_folders_str)
             else:
                 # 单个紧凑题单独占一行（通栏显示）
                 idx += 1
-                html_body, _ = _html_build_question_body(item, idx)
+                html_body, _ = _html_build_question_body(item, idx, is_compact=True)
                 body_parts.append(f'<div class="full-width"><div class="question-card">{html_body}</div></div>')
                 i += 1
         else:
             # 常规型：通栏
             idx += 1
-            html_body, _ = _html_build_question_body(item, idx)
+            html_body, _ = _html_build_question_body(item, idx, is_compact=False)
             body_parts.append(f'<div class="full-width"><div class="question-card">{html_body}</div></div>')
             i += 1
 
