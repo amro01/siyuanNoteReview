@@ -526,7 +526,8 @@ def estimate_compact_height(item):
 
     计算方式：
       - 文本行数：按半栏宽度 20 字/行计算
-      - 留白行数：纯文字题按文字行数的 0.4 倍 + 1，有图片则不留白
+      - 留白行数：纯文字题按文字行数的 0.8 倍 + 2（至少4行），有图片则不留白
+      - 单行高度：30px（文本 + 留白统一标准）
       - 图片高度：按半栏宽度 340px 等比缩放
     """
     text = item[4] if len(item) > 4 else ""
@@ -538,8 +539,8 @@ def estimate_compact_height(item):
     if text:
         text_lines = sum(math.ceil(len(p) / 20) for p in text.split("\n") if p.strip())
 
-    spacer_lines = 0 if images else max(2, math.ceil(text_lines * 0.4) + 1)
-    h += (text_lines + spacer_lines) * 25
+    spacer_lines = 0 if images else max(4, math.ceil(text_lines * 0.8) + 2)
+    h += (text_lines + spacer_lines) * 30
 
     # 2. 计算图片高度（假设半栏宽度约为 340px）
     for img_path in images:
@@ -731,8 +732,8 @@ def _html_build_question_body(item, idx, is_compact=False):
             para = para.strip()
             if para:
                 text_lines += math.ceil(len(para) / chars_per_line)
-        spacer_lines = max(2, math.ceil(text_lines * 0.4) + 1)
-        spacer_height = spacer_lines * 25
+        spacer_lines = max(4, math.ceil(text_lines * 0.8) + 2)
+        spacer_height = spacer_lines * 30
         parts.append(f'<div class="q-spacer" style="height: {spacer_height}px; width: 100%; display: block; color: transparent;">&nbsp;</div>')
 
     return "\n".join(parts), has_images
