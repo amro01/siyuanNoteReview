@@ -682,9 +682,19 @@ def _html_build_question_body(item, idx, is_compact=False):
         if tag:
             parts.append(f'<div class="q-image">{tag}</div>')
 
-    # 预留做题书写空间（半栏题 50px，通栏题 90px）
-    spacer_height = "50px" if is_compact else "90px"
-    parts.append(f'<div class="q-spacer" style="min-height: {spacer_height}; width: 100%;"></div>')
+    # 预留做题书写空间
+    # 如果题目包含图片（images 列表不为空），则不追加留白（因为图片通常自带答题空间）
+    if not has_images:
+        # 纯文字题目，根据文本量动态计算留白
+        chars_per_line = 20 if is_compact else 40
+        text_lines = 0
+        for para in text.split("\n"):
+            para = para.strip()
+            if para:
+                text_lines += math.ceil(len(para) / chars_per_line)
+        spacer_lines = max(3, text_lines + 3)
+        spacer_height = spacer_lines * 30
+        parts.append(f'<div class="q-spacer" style="min-height: {spacer_height}px; width: 100%;"></div>')
 
     return "\n".join(parts), has_images
 
