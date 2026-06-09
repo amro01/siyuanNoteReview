@@ -518,6 +518,45 @@ def estimate_total_pages(items):
     return max(1, math.ceil(total_lines / lines_per_page))
 
 
+def estimate_compact_height(item):
+    """
+    估算半栏题目在最终渲染时所需的物理高度（像素）。
+    用于对半栏题按高度排序，使高度相近的题目自动配对到同一排，
+    避免因高度差异过大触发跨页防断规则、在页底留下大量空白。
+
+    计算方式：
+      - 文本行数：按半栏宽度 20 字/行计算
+      - 留白行数：纯文字题按文字行数的 0.4 倍 + 1，有图片则不留白
+      - 图片高度：按半栏宽度 340px 等比缩放
+    """
+    text = item[4] if len(item) > 4 else ""
+    images = item[5] if len(item) > 5 else []
+
+    h = 0
+    # 1. 计算文本与留白高度
+    text_lines = 0
+    if text:
+        text_lines = sum(math.ceil(len(p) / 20) for p in text.split("\n") if p.strip())
+
+    spacer_lines = 0 if images else max(2, math.ceil(text_lines * 0.4) + 1)
+    h += (text_lines + spacer_lines) * 25
+
+    # 2. 计算图片高度（假设半栏宽度约为 340px）
+    for img_path in images:
+        phys = map_image_path(img_path)
+        if phys and os.path.isfile(phys):
+            if _HAS_PIL:
+                try:
+                    with Image.open(phys) as im:
+                        w, img_h = im.size
+                        h += img_h * (340 / w) if w > 0 else 200
+                except Exception:
+                    h += 200
+            else:
+                h += 200
+    return h
+
+
 # ============================================================
 #  紧凑题目判断
 # ============================================================
@@ -1069,7 +1108,14 @@ def main():
         print("\n❌ 没有符合选题条件的题目。")
         return
 
-    # 4) 生成练习卷 HTML → PDF
+    # 4) 高度智能配对：对半栏题按估算高度排序，使高度相近的题目自动配对到同一排
+    compact_items = [item for item in selected if is_compact_item(item)]
+    normal_items = [item for item in selected if not is_compact_item(item)]
+    compact_items.sort(key=estimate_compact_height, reverse=True)
+    selected = compact_items + normal_items
+    print(f"📐 重排完成：{len(compact_items)} 道半栏题 + {len(normal_items)} 道通栏题")
+
+    # 5) 生成练习卷 HTML → PDF
     print(f"\n{'=' * 60}")
     print(f"📦 正在生成练习卷 HTML ({len(selected)} 道大题)……")
     practice_html = generate_html_practice(selected, current_time_str, target_folders_str)
