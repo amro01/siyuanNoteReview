@@ -253,9 +253,10 @@ def parse_score_table(md_source):
     逻辑：
       - 用 re.findall 抓取表格块（| 开头到空行之间的段落）
       - 找到包含"总积分"的表格
-      - 按行分割，从最后一行向上寻找数据行
-      - 按 | 分割，取最后一个非空元素（从后往前数）
-      - 清理 {:...} 属性后提取数字
+      - 按行分割，从最后一行向上遍历
+      - 对每一行按 | 分割，检查倒数第二个元素（parts[-2]，因为表格通常以 | 结尾）
+      - 跳过空单元格行（如 |练习|||||），继续向上找
+      - 找到包含数字（含负数）的行后，提取数字返回
     返回 int，无表格返回 None。
     """
     if not md_source:
@@ -277,37 +278,38 @@ def parse_score_table(md_source):
     # 3) 按行分割
     lines = [l.strip() for l in target_block.split("\n") if l.strip()]
 
-    # 4) 从最后一行向上寻找数据行（跳过分隔行和空行）
-    data_line = None
+    # 4) 从最后一行向上遍历，寻找倒数第二列包含数字的数据行
     for line in reversed(lines):
+        # 跳过分隔行
         if re.match(r'^[\s\|:\-]+$', line) and "---" in line:
             continue
         if line.count("|") < 2:
             continue
-        data_line = line
-        break
 
-    if data_line is None:
-        return None
+        # 按 | 分割，取倒数第二个元素（表格通常以 | 结尾，content 在 parts[-2]）
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 3:
+            continue
+        target_cell = parts[-2]
 
-    print(f"  [DEBUG] 识别到的最后一行: {data_line}")
+        # 清理 {:...} 属性
+        target_cell_clean = re.sub(r'\{:\s*[^}]*\}', '', target_cell).strip()
 
-    # 5) 按 | 分割，取最后一个非空元素
-    parts = [p.strip() for p in data_line.split("|")]
-    non_empty = [p for p in parts if p]
-    if not non_empty:
-        return None
-    last_val_raw = non_empty[-1]
+        print(f"  [DEBUG] 检查行: {line}")
+        print(f"  [DEBUG] 倒数第二列内容: {target_cell_clean!r}")
 
-    # 6) 清理 {:...} 属性
-    last_val_clean = re.sub(r'\{:\s*[^}]*\}', '', last_val_raw).strip()
+        # 如果单元格为空，继续向上找
+        if not target_cell_clean:
+            continue
 
-    print(f"  [DEBUG] 找到总积分列内容: {last_val_clean}")
+        # 提取数字（支持负数）
+        m = re.search(r'(-?\d+(?:\.\d+)?)', target_cell_clean)
+        if m:
+            value = int(float(m.group(1)))
+            print(f"  [DEBUG] 提取到积分值: {value}")
+            return value
 
-    # 7) 提取数字
-    m = re.search(r'(\d+(?:\.\d+)?)', last_val_clean)
-    if m:
-        return int(float(m.group(1)))
+    # 所有数据行都遍历完仍未找到数字
     return None
 
 
@@ -368,6 +370,8 @@ def parse_question(md_source):
 
     text = "\n".join(text_parts).strip()
     text = re.sub(r'\s*\[图片\]\s*', '', text)
+    # 去除 Kramdown 转义符：\任何字符 → 字符本身
+    text = re.sub(r'\\(.)', r'\1', text)
 
     if not text and not image_paths:
         return None
@@ -431,6 +435,8 @@ def parse_answer(md_source):
 
     text = "\n".join(text_parts).strip()
     text = re.sub(r'\s*\[图片\]\s*', '', text)
+    # 去除 Kramdown 转义符：\任何字符 → 字符本身
+    text = re.sub(r'\\(.)', r'\1', text)
 
     if not text and not image_paths:
         print(f"  [DEBUG] parse_answer 提取为空，原始 Kramdown 前 100 字符:")
@@ -538,7 +544,7 @@ def is_compact_item(item):
             with Image.open(phys) as img:
                 w_px, h_px = img.size
             ratio = w_px / h_px if h_px > 0 else 1.0
-            if ratio >= 1.3:
+            if ratio >= 1.7:
                 return False
         except Exception:
             continue
@@ -675,6 +681,9 @@ def _html_build_question_body(item, idx):
         tag = _html_image_tag(img_path)
         if tag:
             parts.append(f'<div class="q-image">{tag}</div>')
+
+    # 预留做题书写空间
+    parts.append('<div class="q-spacer" style="min-height: 80px; width: 100%;"></div>')
 
     return "\n".join(parts), has_images
 
