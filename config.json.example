@@ -5,5 +5,7 @@
     "SIYUAN_DATA_PATH": "/path/to/siyuan/workspace/data",
     "TARGET_FOLDERS": ["DS0001"],
     "SCORE_THRESHOLD": 3,
-    "MIN_PAGES": 2
+    "MIN_PAGES": 2,
+    "MAX_PAGES": 10,
+    "EXCLUDE_RECENT_DAYS": 2
 }

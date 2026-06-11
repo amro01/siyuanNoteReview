@@ -10,6 +10,13 @@
   2. 按积分筛选已掌握/待练习题目
   3. 生成 HTML 练习卷 + 答案卷，使用 CSS 打印媒体排版
   4. 用 WeasyPrint 将 HTML 编译为 PDF
+
+升级 v2 特性：
+  - 优先排序：易错池按积分升序（多次错误优先），基础池也按积分升序
+  - 入选顺序：先基础、再易错、最后困难补充
+  - 困难题在标题前加 ⭐ 标注
+  - 新增 MAX_PAGES 最大页数限制（默认 10）
+  - 新增 EXCLUDE_RECENT_DAYS 排除最近录入/复习题目（默认 2 天）
 """
 
 import requests
@@ -20,7 +27,7 @@ import sys
 import math
 import html
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 
 try:
     from PIL import Image
@@ -45,6 +52,10 @@ def load_config(config_path="config.json"):
     """
     从 config.json 加载配置，并将变量设置到模块全局作用域。
     如果文件不存在，给出友好提示并退出。
+
+    新增配置项（兼容旧文件，自动设置默认值）：
+      - MAX_PAGES: 最大页数限制（默认 10）
+      - EXCLUDE_RECENT_DAYS: 排除最近几天内录入/复习的题目（默认 2）
     """
     if not os.path.isfile(config_path):
         print(f"❌ 未找到配置文件 {config_path}")
@@ -57,7 +68,7 @@ def load_config(config_path="config.json"):
 
     # 将配置注入模块全局变量
     global SIYUAN_URL, API_TOKEN, NOTEBOOK_ID, SIYUAN_DATA_PATH
-    global TARGET_FOLDERS, SCORE_THRESHOLD, MIN_PAGES, HEADERS
+    global TARGET_FOLDERS, SCORE_THRESHOLD, MIN_PAGES, MAX_PAGES, EXCLUDE_RECENT_DAYS, HEADERS
 
     SIYUAN_URL = cfg["SIYUAN_URL"]
     API_TOKEN = cfg["API_TOKEN"]
@@ -66,6 +77,11 @@ def load_config(config_path="config.json"):
     TARGET_FOLDERS = cfg["TARGET_FOLDERS"]
     SCORE_THRESHOLD = cfg["SCORE_THRESHOLD"]
     MIN_PAGES = cfg["MIN_PAGES"]
+
+    # 新增配置：最大页数限制，默认 10
+    MAX_PAGES = cfg.get("MAX_PAGES", 10)
+    # 新增配置：排除最近几天的题目，默认 2 天
+    EXCLUDE_RECENT_DAYS = cfg.get("EXCLUDE_RECENT_DAYS", 2)
 
     HEADERS = {
         "Authorization": f"Token {API_TOKEN}",
@@ -117,7 +133,7 @@ def find_target_dirs():
         # 1) SQL 模糊匹配：匹配 hpath 或 content（文档标题）
         sql = (f"SELECT id, hpath, content FROM blocks "
                f"WHERE type='d' AND (content LIKE '%{target}%' OR hpath LIKE '%{target}%') "
-               f"AND box='{NOTEBOOK_ID}' LIMIT 1")
+               f"AND box='{NOTEBOOK_ID}' ORDER BY length(hpath) ASC LIMIT 1")
         result = call_api("/api/query/sql", {"stmt": sql})
         if result.get("code") == 0:
             rows = result.get("data", [])
@@ -172,6 +188,81 @@ def get_doc_title(doc_id):
     if result.get("code") != 0:
         return None
     return result.get("data")
+
+
+def parse_latest_date(md_source):
+    """
+    从文档正文的 Markdown 表格中提取最新练习/录入日期。
+    查找包含"录入与练习日期"列的表，从最后一行向上遍历，
+    提取对应列的日期文本并解析为 datetime 对象。
+
+    支持的日期格式：2026年4月12日、2026-04-12、2026/4/12 等。
+
+    返回 datetime 对象，如果未找到任何日期则返回 None。
+    """
+    if not md_source:
+        return None
+
+    # 1) 找出包含"录入与练习日期"文本的表格块
+    table_blocks = re.findall(r'^(?:\|.*\n?)+', md_source, re.MULTILINE)
+
+    target_block = None
+    for block in table_blocks:
+        if "录入与练习日期" in block:
+            target_block = block
+            break
+
+    if target_block is None:
+        return None
+
+    # 2) 按行分割并找出表头行
+    lines = [l.strip() for l in target_block.split("\n") if l.strip()]
+
+    # 找到表头行（包含"录入与练习日期"的行）
+    date_col_idx = 2  # 默认索引 2
+    for line in lines:
+        if "录入与练习日期" in line:
+            # 通过 | 分割找出"录入与练习日期"所在的列索引
+            parts = [p.strip() for p in line.split("|")]
+            for j, p in enumerate(parts):
+                if "录入与练习日期" in p:
+                    date_col_idx = j
+                    break
+            break
+
+    # 3) 从该表格的最后一行向上遍历数据行
+    for line in reversed(lines):
+        # 跳过分隔行
+        if re.match(r'^[\s\|:\-]+$', line) and "---" in line:
+            continue
+        # 跳过表头行
+        if "录入与练习日期" in line:
+            continue
+
+        parts = [p.strip() for p in line.split("|")]
+        if date_col_idx >= len(parts):
+            continue
+
+        cell_text = parts[date_col_idx]
+        # 清理 {:...} 属性
+        cell_text = re.sub(r'\{:\s*[^}]*\}', '', cell_text).strip()
+
+        if not cell_text:
+            continue
+
+        # 4) 使用正则匹配日期：兼容 2026年4月12日、2026-04-12、2026/4/12 等
+        m = re.search(r'(\d{4})\s*[-年/]\s*(\d{1,2})\s*[-月/]\s*(\d{1,2})', cell_text)
+        if m:
+            year = int(m.group(1))
+            month = int(m.group(2))
+            day = int(m.group(3))
+            try:
+                return datetime(year, month, day)
+            except ValueError:
+                continue
+
+    # 5) 整个表格没有解析到任何日期，返回 None
+    return None
 
 
 # ============================================================
@@ -593,12 +684,21 @@ def is_compact_item(item):
 
 
 # ============================================================
-#  选题引擎 (Selection Engine)
+#  选题引擎 (Selection Engine) — 升级版
 # ============================================================
 def select_questions(all_docs):
     """
-    all_docs: [(doc_id, title, category, score, answer_md_source_or_None), ...]
+    all_docs: [(doc_id, title, category, score), ...]
     返回最终入选的文档列表 [(doc_id, title, cat, score, text, images, answer_md), ...]
+
+    升级 v2 排序与选择逻辑：
+      1. 初筛：总积分 < SCORE_THRESHOLD 或 积分未检测到 → 进入候选池
+      2. 分类：按 cat 分入"基础"、"易错"、"困难"三个池
+      3. 排序：每个池均按积分升序排序（积分越低 → 错误越多 → 越优先）
+      4. 入选顺序：先遍历加入"基础"题，再遍历加入"易错"题
+      5. 困难补充：如果页数不足 MIN_PAGES，从"困难"池按积分升序补充
+      6. 页数上限：每次添加前检查 estimate_total_pages(selected) 是否已达 MAX_PAGES，
+         如果已达上限，立即停止添加任何题目
     """
     # 1) 初筛：总积分 < SCORE_THRESHOLD 或 积分未检测到
     eligible = []
@@ -630,34 +730,48 @@ def select_questions(all_docs):
             return (doc_id, title, cat, score, parsed["text"], parsed["images"], md)
         return None
 
-    # 3) 基础 + 易错 全部入选
+    # 3) 对每个池按积分升序排序（积分越低表示错误越多，越优先入选）
+    #    注意：score 为 None 的题目视为"最优先"（未检测到积分表 = 全新题目）
+    def sort_by_score_asc(d):
+        """积分升序排序 key：None 视为 -1（最优先）"""
+        s = d[3]
+        return -1 if s is None else s
+
+    for cat_name in pools:
+        pools[cat_name].sort(key=sort_by_score_asc)
+
+    # 4) 按顺序入选：先基础，再易错
     selected = []
     for cat in ["基础", "易错"]:
         for d in pools.get(cat, []):
+            # 检查页数上限：如果已达 MAX_PAGES，停止添加
+            if estimate_total_pages(selected) >= MAX_PAGES:
+                print(f"   ⏹️  已达最大页数限制 {MAX_PAGES} 页，停止添加 {cat} 题")
+                break
             item = fetch_content(d)
             if item:
                 selected.append(item)
 
-    # 4) 页数不足时从困难池补充
+    # 5) 页数不足 MIN_PAGES 时，从困难池按积分升序补充
     current_pages = estimate_total_pages(selected)
     print(f"📊 当前已选题数: {len(selected)}，估算页数: ~{current_pages} 页")
 
     if current_pages < MIN_PAGES and pools.get("困难"):
         needed = pools["困难"]
-        def sort_key(d):
-            s = d[3]
-            return -1 if s is None else s
-        needed.sort(key=sort_key, reverse=True)
-
-        print(f"📌 页数不足 {MIN_PAGES} 页，从困难池补充 {len(needed)} 道候选题……")
+        # 困难池已按积分升序排序，优先选择错误最多的困难题
+        print(f"📌 页数不足 {MIN_PAGES} 页，从困难池补充（按积分升序，共 {len(needed)} 道候选题）……")
 
         for d in needed:
             if estimate_total_pages(selected) >= MIN_PAGES:
                 break
+            # 补充时也要检查最大页数限制
+            if estimate_total_pages(selected) >= MAX_PAGES:
+                print(f"   ⏹️  已达最大页数限制 {MAX_PAGES} 页，停止补充困难题")
+                break
             item = fetch_content(d)
             if item:
                 selected.append(item)
-                print(f"   ➕ 补充: {shorten_title(d[1])} (积分: {d[3]})")
+                print(f"   ➕ 补充困难题: {shorten_title(d[1])} (积分: {d[3]})")
     elif current_pages < MIN_PAGES:
         yellow = "\033[93m"
         reset = "\033[0m"
@@ -700,9 +814,16 @@ def _html_build_question_body(item, idx, is_compact=False):
     """
     构建单道题目的 HTML 内容字符串（不含外层容器标签）。
     返回 (html_content, has_images) 元组。
+
+    升级 v2：如果 cat == "困难"，在标题前加 ⭐ 符号。
     """
     doc_id, full_title, cat, score, text, images, answer_md = item
     display_title = format_question_title(full_title)
+
+    # 升级 v2：困难题在标题前加 ⭐ 符号
+    if cat == "困难":
+        display_title = f"⭐ {display_title}"
+
     parts = []
 
     # 标题
@@ -896,6 +1017,8 @@ def generate_html_answer(selected_items, current_time_str, target_folders_str):
     生成 HTML 答案卷源码字符串。
     通栏排版，每道题显示序号 + 答案内容 + 答案图片。
     使用 break-inside: avoid 防止单个答案跨页。
+
+    升级 v2：如果 cat == "困难"，在标题前加 ⭐ 符号。
     """
     date_str = current_time_str[:10]
 
@@ -969,6 +1092,10 @@ def generate_html_answer(selected_items, current_time_str, target_folders_str):
     for idx, item in enumerate(selected_items, 1):
         doc_id, full_title, cat, score, text, images, answer_md = item
         display_title = format_question_title(full_title)
+
+        # 升级 v2：困难题在答案标题前也加 ⭐ 符号
+        if cat == "困难":
+            display_title = f"⭐ {display_title}"
 
         # 解析答案
         answer_data = parse_answer(answer_md) if answer_md else None
@@ -1054,7 +1181,8 @@ def main():
 
     print(f"\n🎯 当前选题范围: {TARGET_FOLDERS}")
     print(f"   积分阈值: < {SCORE_THRESHOLD} (已掌握跳过)")
-    print(f"   目标页数: >= {MIN_PAGES} 页")
+    print(f"   目标页数: {MIN_PAGES} ~ {MAX_PAGES} 页")
+    print(f"   排除最近 {EXCLUDE_RECENT_DAYS} 天内新增/复习的题目")
     print()
 
     # 1) 查找目录
@@ -1079,13 +1207,22 @@ def main():
             if title is None:
                 print(f"   ⚠️  {name} → 获取标题失败")
                 continue
-
             cat = classify_document(title)
             short = shorten_title(title)
 
             print(f"   📄 {name} → {short}  [{cat}]")
 
             md = get_block_kramdown(doc_id)
+
+            # 通过 Markdown 表格中的练习日期判断是否需要跳过
+            latest_date = parse_latest_date(md) if md else None
+            if latest_date is not None:
+                days_diff = (datetime.now().date() - latest_date.date()).days
+                if days_diff <= EXCLUDE_RECENT_DAYS:
+                    short = shorten_title(title)
+                    print(f"   [跳过] 距上次练习/录入不足 {EXCLUDE_RECENT_DAYS} 天：{short} (距今 {days_diff} 天)")
+                    continue
+
             score = parse_score_table(md) if md else None
             if score is not None:
                 print(f"       总积分: {score}")
