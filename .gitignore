@@ -7,6 +7,7 @@ config.json
 __pycache__/
 .vscode/
 计划.md
+plans/
 
 
 # Python 常用忽略（推荐一起加上，避免上传垃圾文件）
