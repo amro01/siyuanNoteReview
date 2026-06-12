@@ -130,56 +130,101 @@ def list_dir_entries(dir_path):
 def find_target_dirs():
     matched = []
     for target in TARGET_FOLDERS:
-        # 1) SQL 模糊匹配：匹配 hpath 或 content（文档标题）
-        sql = (f"SELECT id, hpath, content FROM blocks "
-               f"WHERE type='d' AND (content LIKE '%{target}%' OR hpath LIKE '%{target}%') "
-               f"AND box='{NOTEBOOK_ID}' ORDER BY length(hpath) ASC LIMIT 1")
+        target_stripped = target.strip()
+        
+        # 1) SQL 模糊匹配（全量查询，不限制笔记本）
+        sql = (f"SELECT id, hpath, content, box FROM blocks "
+               f"WHERE type='d' AND (content LIKE '%{target_stripped}%' OR hpath LIKE '%{target_stripped}%') "
+               f"ORDER BY hpath ASC")
         result = call_api("/api/query/sql", {"stmt": sql})
         if result.get("code") == 0:
             rows = result.get("data", [])
+            print(f"  [DEBUG] SQL 查询结果: {rows}")
             if rows:
-                row = rows[0]
-                block_id = row.get("id", "")
-                hpath = row.get("hpath", "")
+                # 优先匹配当前笔记本中的文档
+                best_row = None
+                for row in rows:
+                    nb_id = row.get("box", "")
+                    if nb_id == NOTEBOOK_ID:
+                        best_row = row
+                        break
+                if best_row is None:
+                    best_row = rows[0]
+                
+                block_id = best_row.get("id", "")
+                hpath = best_row.get("hpath", "")
                 if block_id:
                     matched.append({
-                        "name": target,
-                        "path": f"/data/{NOTEBOOK_ID}/{block_id}"
+                        "name": target_stripped,
+                        "id": block_id,
+                        "hpath": hpath,
+                        "type": "doc"
                     })
-                    print(f"   📂 找到目录 {target} → hpath: {hpath}")
+                    print(f"   📂 找到目录 {target_stripped} → hpath: {hpath}, id: {block_id}")
                     continue
-
-        # 2) SQL 没找到 → 尝试匹配笔记本名称
+        else:
+            print(f"  [ERROR] SQL 查询失败: {result.get('msg')}")
+        
+        # 2) SQL 没找到 → 尝试匹配笔记本名称（去除前后空格后比较）
         nb_result = call_api("/api/notebook/lsNotebooks")
         if nb_result.get("code") == 0:
             notebooks = nb_result.get("data", [])
             found_nb = False
             for nb in notebooks:
-                nb_name = nb.get("name", "")
+                nb_name = nb.get("name", "").strip()
                 nb_id = nb.get("id", "")
-                if target in nb_name and nb_id == NOTEBOOK_ID:
+                if target_stripped in nb_name:
                     matched.append({
-                        "name": target,
-                        "path": f"/data/{NOTEBOOK_ID}"
+                        "name": target_stripped,
+                        "id": nb_id,
+                        "hpath": f"/{nb_name}",
+                        "type": "notebook"
                     })
-                    print(f"   📂 找到目录 {target} → 匹配笔记本名称: {nb_name}")
+                    print(f"   📂 找到目录 {target_stripped} → 匹配笔记本名称: {nb_name} (id: {nb_id})")
                     found_nb = True
                     break
             if not found_nb:
-                print(f"  DEBUG: 尝试匹配关键词 '{target}' 失败，请检查思源中是否存在该标题的文档。")
+                print(f"  DEBUG: 尝试匹配关键词 '{target_stripped}' 失败，请检查思源中是否存在该标题的文档。")
         else:
-            print(f"  DEBUG: 尝试匹配关键词 '{target}' 失败，请检查思源中是否存在该标题的文档。")
+            print(f"  DEBUG: 尝试匹配关键词 '{target_stripped}' 失败，请检查思源中是否存在该标题的文档。")
     return matched
 
 
-def list_sy_files_in_dir(dir_path):
-    entries = list_dir_entries(dir_path)
+def list_sy_files_in_dir(target_dir):
+    """
+    使用 SQL 查询获取目标目录下的所有子文档。
+    不再依赖 /api/file/readDir 物理扫描文件系统。
+    
+    参数：
+      target_dir: dict，包含 "id" 和 "hpath" 两个 key
+                  - id: 目标文档的 block ID
+                  - hpath: 目标文档的 hpath（路径字符串）
+    
+    返回：
+      [(doc_name, doc_id), ...]  其中 doc_name 为文档标题的末段（用于显示）
+    """
+    hpath = target_dir.get("hpath", "")
+    doc_id = target_dir.get("id", "")
+    
+    sql = (f"SELECT id, content FROM blocks "
+           f"WHERE type='d' AND hpath LIKE '{hpath}/%' "
+           f"ORDER BY hpath ASC")
+    result = call_api("/api/query/sql", {"stmt": sql})
+    
     sy_files = []
-    for entry in entries:
-        name = entry.get("name", "")
-        if name.endswith(".sy") and not entry.get("isDir", False):
-            doc_id = name[:-3]
-            sy_files.append((name, doc_id))
+    if result.get("code") == 0:
+        rows = result.get("data", [])
+        for row in rows:
+            child_id = row.get("id", "")
+            content = row.get("content", "")
+            if child_id:
+                # 从 content 提取标题（content 中第一段通常是标题文本）
+                # content 可能是纯文本，提取第一行作为 doc_name
+                title_line = content.strip().split("\n")[0] if content else child_id
+                sy_files.append((title_line, child_id))
+    else:
+        print(f"  ⚠️  SQL 查询目录子文档失败 [{hpath}]：{result.get('msg')}")
+    
     return sy_files
 
 
@@ -1194,12 +1239,12 @@ def main():
 
     print(f"📁 正在针对以下目录扫描：")
     for d in target_dirs:
-        print(f"   📂 {d['name']}  ({d['path']})")
+        print(f"   📂 {d['name']}  (hpath: {d['hpath']}, id: {d['id']})")
 
     # 2) 收集文档
     all_docs = []  # [(doc_id, title, cat, score)]
     for td in target_dirs:
-        sy_files = list_sy_files_in_dir(td["path"])
+        sy_files = list_sy_files_in_dir(td)
         print(f"\n📂 [{td['name']}] 找到 {len(sy_files)} 个文档")
 
         for name, doc_id in sy_files:
