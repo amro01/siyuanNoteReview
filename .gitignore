@@ -8,6 +8,7 @@ __pycache__/
 .vscode/
 计划.md
 plans/
+debug_kramdown.txt
 
 
 # Python 常用忽略（推荐一起加上，避免上传垃圾文件）

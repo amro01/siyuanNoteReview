@@ -26,6 +26,8 @@ import os
 import sys
 import math
 import html
+import io
+import base64
 import urllib.parse
 from datetime import datetime, timedelta
 
@@ -450,59 +452,89 @@ def parse_score_table(md_source):
 
 
 # ============================================================
-#  精准题目解析（练习卷用）— 重写版
+#  Kramdown 清洗工具（兼容思源新版 IAL 格式）
 # ============================================================
-def parse_question(md_source):
+# 思源新版会在块的正文/标题行后附加 IAL 属性块，例如：
+#   # 题目 {: id="..." updated="..."}
+#   > 正文
+#   > {: id="..." updated="..."}
+#   >
+#   {: id="..." updated="..."}
+# 因此这里先统一清洗 IAL，再做标题匹配与正文提取。
+_IAL_RE = re.compile(r'\{:\s*[^}]*\}')
+
+
+def _strip_ial(text):
+    """移除行内 Kramdown IAL 属性块 {: ... }（兼容行内与独立成行两种写法）。"""
+    return _IAL_RE.sub('', text or '')
+
+
+def _heading_text(line):
     """
-    从源码中提取题目内容。
-    匹配：以 # 题目 或 ## 题目 开头的行。
-    结束：以 ## 答案 开头的行。
-    提取图片路径时需在清理 {:...} 之前执行。
+    若该行是 Markdown 标题，返回去掉 # 前缀与 IAL 后的标题文本；否则返回 None。
+    兼容：'# 题目'、'## 答案'、'## 答案 {: id="..."}'、'## 💡 答案'、'#题目' 等。
     """
-    if not md_source:
+    m = re.match(r'^\s*(#{1,6})\s*(.*)$', line or '')
+    if not m:
         return None
+    return _strip_ial(m.group(2)).strip()
 
-    raw_lines = md_source.split("\n")
 
-    # 寻找 # 题目 或 ## 题目
-    start_idx = -1
-    for i, line in enumerate(raw_lines):
-        s = line.strip()
-        if re.match(r'^#{1,2}\s+题目', s):
-            start_idx = i
-            break
+def _is_question_heading(heading_text):
+    """判断是否为题目区标题（# 题目 / ## 题目），排除“扩展题目XX”。"""
+    if not heading_text:
+        return False
+    core = heading_text.strip('* \t　')
+    return core.startswith('题目')
 
-    if start_idx == -1:
-        return None
 
-    # 截取到 ## 答案 为止
-    content_lines = []
-    for line in raw_lines[start_idx + 1:]:
-        s = line.strip()
-        if re.match(r'^##\s*答案', s):
-            break
-        if re.match(r'^##\s*💡\s*答案', s):
-            break
-        content_lines.append(line)
+def _is_answer_heading(heading_text):
+    """
+    判断是否为主答案区标题（## 答案 / ## 💡 答案），
+    排除“扩展题目01 答案”这类带前缀的标题。
+    """
+    if not heading_text:
+        return False
+    core = heading_text.strip('* \t　').lstrip('💡✅☑✔️').strip()
+    return core.startswith('答案')
 
-    # 先提取图片路径（在清理 {:...} 之前！）
+
+def _clean_md_line(line):
+    """
+    清洗单行 Kramdown 正文：
+      1. 去除 IAL 属性块 {: ... }
+      2. 去除引用标记 >
+      3. 去除图片语法与 [图片] 占位符
+    返回清洗后的文本（可能为空字符串）。
+    """
+    s = _strip_ial(line).strip()
+    s = re.sub(r'^>\s*', '', s)
+    s = re.sub(r'!\[.*?\]\([^)]+\)', '', s)
+    s = re.sub(r'\s*\[图片\]\s*', '', s)
+    return s.strip()
+
+
+def _extract_block(content_lines):
+    """
+    从一组正文行中提取文字与图片路径。
+    注意：图片路径必须在清洗 IAL / 引用标记之前提取。
+    返回 {"text": "...", "images": [...]}，若均无内容则返回 None。
+    """
+    # 1) 先提取图片路径（在清理 {:...} 与 > 之前）
     image_paths = []
     for line in content_lines:
-        for m in re.finditer(r'!\[.*?\]\((/?)assets/([^)]+)\)', line):
+        for m in re.finditer(r'!\[.*?\]\(\s*<?(/?)assets/([^)>\s]+)', line):
             prefix = "/" if m.group(1) else ""
             full = f"{prefix}assets/{m.group(2)}"
             if full not in image_paths:
                 image_paths.append(full)
 
-    # 再清理 {:...} 和提取文字
+    # 2) 再清洗文本
     text_parts = []
     for line in content_lines:
-        s = re.sub(r'\{:\s*[^}]*\}', '', line).strip()
-        s = re.sub(r'^>\s*', '', s)
-        s = re.sub(r'!\[.*?\]\([^)]+\)', '', s)
-        s = re.sub(r'\s*\[图片\]\s*', '', s)
-        if s.strip():
-            text_parts.append(s.strip())
+        s = _clean_md_line(line)
+        if s:
+            text_parts.append(s)
 
     text = "\n".join(text_parts).strip()
     text = re.sub(r'\s*\[图片\]\s*', '', text)
@@ -511,18 +543,17 @@ def parse_question(md_source):
 
     if not text and not image_paths:
         return None
-
     return {"text": text, "images": image_paths}
 
 
 # ============================================================
-#  答案解析（答案卷用）— 重写版
+#  精准题目解析（练习卷用）— 重写版 v2.4
 # ============================================================
-def parse_answer(md_source):
+def parse_question(md_source):
     """
-    从源码中提取答案内容。
-    匹配：以 ## 答案 或 ## 💡 答案 开头的二级标题。
-    结束：以 ## 扩展题目 或下一个 ## 标题开头。
+    从源码中提取题目内容。
+    匹配：以 # 题目 / ## 题目 为标题的行（兼容行尾附带 IAL 属性）。
+    结束：遇到主答案标题（## 答案 / ## 💡 答案 / # 答案 等）。
     提取图片路径时需在清理 {:...} 之前执行。
     返回 {"text": "...", "images": [...]}，没有则返回 None。
     """
@@ -531,55 +562,61 @@ def parse_answer(md_source):
 
     raw_lines = md_source.split("\n")
 
-    # 定位 ## 答案（兼容各种写法）
+    # 1) 定位题目标题（兼容行尾 IAL）
     start_idx = -1
     for i, line in enumerate(raw_lines):
-        s = line.strip()
-        if re.match(r'^##[^#]*答案', s):
+        if _is_question_heading(_heading_text(line)):
             start_idx = i
             break
 
     if start_idx == -1:
         return None
 
-    # 取到下一个 ## 或文档结尾，但跳过 "## 扩展题目"
+    # 2) 截取到主答案标题为止（# 答案 / ## 答案 / ## 💡 答案 及其带 IAL 的写法）
     content_lines = []
     for line in raw_lines[start_idx + 1:]:
-        s = line.strip()
-        if s.startswith("##"):
+        if _is_answer_heading(_heading_text(line)):
             break
         content_lines.append(line)
 
-    # 先提取图片路径（在清理 {:...} 之前！）
-    image_paths = []
-    for line in content_lines:
-        for m in re.finditer(r'!\[.*?\]\((/?)assets/([^)]+)\)', line):
-            prefix = "/" if m.group(1) else ""
-            full = f"{prefix}assets/{m.group(2)}"
-            if full not in image_paths:
-                image_paths.append(full)
+    return _extract_block(content_lines)
 
-    # 再清理 {:...} 和提取文字
-    text_parts = []
-    for line in content_lines:
-        s = re.sub(r'\{:\s*[^}]*\}', '', line).strip()
-        s = re.sub(r'^>\s*', '', s)
-        s = re.sub(r'!\[.*?\]\([^)]+\)', '', s)
-        s = re.sub(r'\s*\[图片\]\s*', '', s)
-        if s.strip():
-            text_parts.append(s.strip())
 
-    text = "\n".join(text_parts).strip()
-    text = re.sub(r'\s*\[图片\]\s*', '', text)
-    # 去除 Kramdown 转义符：\任何字符 → 字符本身
-    text = re.sub(r'\\(.)', r'\1', text)
-
-    if not text and not image_paths:
-        print(f"  [DEBUG] parse_answer 提取为空，原始 Kramdown 前 100 字符:")
-        print(f"  [DEBUG] {md_source[:100]!r}")
+# ============================================================
+#  答案解析（答案卷用）— 重写版 v2.4
+# ============================================================
+def parse_answer(md_source):
+    """
+    从源码中提取答案内容。
+    匹配：主答案标题（## 答案 / ## 💡 答案 及其带 IAL 的写法）。
+    结束：遇到下一个非答案标题（例如 ## 扩展题目01）或文档结尾。
+    提取图片路径时需在清理 {:...} 之前执行。
+    返回 {"text": "...", "images": [...]}，没有则返回 None。
+    """
+    if not md_source:
         return None
 
-    return {"text": text, "images": image_paths}
+    raw_lines = md_source.split("\n")
+
+    # 1) 定位主答案标题（兼容行尾 IAL）
+    start_idx = -1
+    for i, line in enumerate(raw_lines):
+        if _is_answer_heading(_heading_text(line)):
+            start_idx = i
+            break
+
+    if start_idx == -1:
+        return None
+
+    # 2) 取到下一个非答案标题为止（自动跳过“扩展题目”等后续区块）
+    content_lines = []
+    for line in raw_lines[start_idx + 1:]:
+        ht = _heading_text(line)
+        if ht is not None and not _is_answer_heading(ht):
+            break
+        content_lines.append(line)
+
+    return _extract_block(content_lines)
 
 
 # ============================================================
@@ -634,6 +671,109 @@ def map_image_path(api_image_path):
 
 
 # ============================================================
+#  资源读取兜底：通过思源 API 直接拉取图片（不依赖本地文件系统）
+# ============================================================
+_ASSET_BYTES_CACHE = {}
+
+# 常见图片扩展名 → MIME 子类型
+_IMAGE_MIME = {
+    "jpg": "jpeg", "jpeg": "jpeg", "png": "png", "gif": "gif",
+    "webp": "webp", "bmp": "bmp", "svg": "svg+xml", "ico": "x-icon",
+}
+
+
+def _asset_api_candidates(api_image_path):
+    """
+    根据思源 API 返回的图片路径，生成 /api/file/getFile 的候选路径。
+    思源资源统一存放在 workspace/data/assets/ 下，因此 'assets/xxx' 需补成 'data/assets/xxx'。
+    """
+    clean = (api_image_path or "").lstrip("/")
+    cands = []
+    if clean.startswith("assets/"):
+        cands.append("data/" + clean)
+    if clean.startswith("data/"):
+        cands.append(clean)
+    if clean.startswith(NOTEBOOK_ID + "/"):
+        sub = clean[len(NOTEBOOK_ID) + 1:]
+        if sub.startswith("assets/"):
+            cands.append("data/" + sub)
+    cands.append(clean)  # 兜底
+    # 去重且保持顺序
+    seen, out = set(), []
+    for c in cands:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def get_asset_bytes(api_image_path):
+    """
+    通过思源 /api/file/getFile 接口拉取资源文件字节（带缓存）。
+
+    这是对 map_image_path（本地文件系统）的兜底方案：
+    当 SIYUAN_DATA_PATH 配置错误、目录不存在或与新版思源不一致时，
+    仍能取到图片，从而修复“题目/答案卡片正文（含图片）为空”的问题。
+
+    返回 bytes，失败返回 None。
+    """
+    if not api_image_path:
+        return None
+    if api_image_path in _ASSET_BYTES_CACHE:
+        return _ASSET_BYTES_CACHE[api_image_path]
+
+    url = f"{SIYUAN_URL}/api/file/getFile"
+    result = None
+    for cand in _asset_api_candidates(api_image_path):
+        for payload_path in (f"/{cand}", cand):
+            try:
+                resp = requests.post(url, headers=HEADERS, json={"path": payload_path}, timeout=15)
+            except Exception:
+                continue
+            if resp.status_code == 200 and resp.content:
+                ctype = resp.headers.get("Content-Type", "")
+                # 成功时返回原始字节；失败时思源返回 JSON（application/json）
+                if "application/json" not in ctype:
+                    result = resp.content
+                    break
+        if result is not None:
+            break
+
+    _ASSET_BYTES_CACHE[api_image_path] = result
+    return result
+
+
+def _image_data_uri(api_image_path):
+    """将思源资源图片转换为 data: base64 URI（用于 WeasyPrint 内嵌），失败返回 None。"""
+    raw = get_asset_bytes(api_image_path)
+    if not raw:
+        return None
+    ext = os.path.splitext(api_image_path)[1].lower().lstrip(".")
+    mime = _IMAGE_MIME.get(ext, "png")
+    b64 = base64.b64encode(raw).decode("ascii")
+    return f"data:image/{mime};base64,{b64}"
+
+
+def _get_pil_image(api_image_path):
+    """
+    尝试获取 PIL Image 对象：优先本地文件，失败则回退 API 字节。
+    返回 Image 对象或 None（调用方负责 close）。
+    """
+    if not _HAS_PIL:
+        return None
+    phys = map_image_path(api_image_path)
+    try:
+        if phys is not None:
+            return Image.open(phys)
+        raw = get_asset_bytes(api_image_path)
+        if raw:
+            return Image.open(io.BytesIO(raw))
+    except Exception:
+        return None
+    return None
+
+
+# ============================================================
 #  页数估算
 # ============================================================
 def estimate_lines(item):
@@ -680,17 +820,16 @@ def estimate_compact_height(item):
 
     # 2. 计算图片高度（假设半栏宽度约为 340px）
     for img_path in images:
-        phys = map_image_path(img_path)
-        if phys and os.path.isfile(phys):
-            if _HAS_PIL:
-                try:
-                    with Image.open(phys) as im:
-                        w, img_h = im.size
-                        h += img_h * (340 / w) if w > 0 else 200
-                except Exception:
-                    h += 200
-            else:
-                h += 200
+        im = _get_pil_image(img_path)
+        if im is None:
+            h += 200
+            continue
+        try:
+            with im:
+                w, img_h = im.size
+                h += img_h * (340 / w) if w > 0 else 200
+        except Exception:
+            h += 200
     return h
 
 
@@ -713,11 +852,11 @@ def is_compact_item(item):
         return True
 
     for img_path in images:
-        phys = map_image_path(img_path)
-        if phys is None or not os.path.isfile(phys):
+        img = _get_pil_image(img_path)
+        if img is None:
             continue
         try:
-            with Image.open(phys) as img:
+            with img:
                 w_px, h_px = img.size
             ratio = w_px / h_px if h_px > 0 else 1.0
             if ratio >= 1.7:
@@ -837,15 +976,27 @@ def select_questions(all_docs):
 def _html_image_tag(api_image_path, max_width="100%"):
     """
     将思源 API 图片路径转换为 HTML <img> 标签。
-    返回空字符串如果图片文件不存在。
+
+    优先使用本地文件（file:// 协议）；当本地映射失败（例如 SIYUAN_DATA_PATH
+    配置错误或目录不存在）时，回退到思源 API 拉取图片并以内嵌 data: base64 URI
+    渲染，确保图片不会丢失。
+    返回空字符串表示两种方式都取不到图片。
     """
+    style = (f'max-width: {max_width}; max-height: 80vh; '
+             f'object-fit: contain; display: block; margin: 4px auto;')
+
     phys = map_image_path(api_image_path)
-    if phys is None:
-        return ""
-    abs_path = os.path.abspath(phys)
-    # 使用 file:// 协议嵌入本地图片，URL-encode 路径中的特殊字符（中文、空格等）
-    abs_path_encoded = urllib.parse.quote(abs_path, safe='/:@!*()')
-    return f'<img src="file://{abs_path_encoded}" style="max-width: {max_width}; max-height: 80vh; object-fit: contain; display: block; margin: 4px auto;" />'
+    if phys is not None:
+        abs_path = os.path.abspath(phys)
+        # 使用 file:// 协议嵌入本地图片，URL-encode 路径中的特殊字符（中文、空格等）
+        abs_path_encoded = urllib.parse.quote(abs_path, safe='/:@!*()')
+        return f'<img src="file://{abs_path_encoded}" style="{style}" />'
+
+    # 本地映射失败 → 通过思源 API 拉取并内嵌为 data URI
+    data_uri = _image_data_uri(api_image_path)
+    if data_uri:
+        return f'<img src="{data_uri}" style="{style}" />'
+    return ""
 
 
 def _html_escape(text):
@@ -1243,6 +1394,9 @@ def main():
 
     # 2) 收集文档
     all_docs = []  # [(doc_id, title, cat, score)]
+    # [DEBUG] 设置环境变量 DEBUG_KRAMDOWN=1 时，导出首个文档原始 Kramdown 便于排查
+    _debug_kramdown = os.environ.get("DEBUG_KRAMDOWN", "") == "1"
+    _debug_kramdown_written = False
     for td in target_dirs:
         sy_files = list_sy_files_in_dir(td)
         print(f"\n📂 [{td['name']}] 找到 {len(sy_files)} 个文档")
@@ -1258,6 +1412,22 @@ def main():
             print(f"   📄 {name} → {short}  [{cat}]")
 
             md = get_block_kramdown(doc_id)
+
+            # [DEBUG] 将第一个成功获取到的文档原始 Kramdown 写入 debug_kramdown.txt，
+            # 用于排查思源新版导出格式（IAL 位置、换行方式等）导致的正文提取为空问题。
+            if _debug_kramdown and not _debug_kramdown_written and md:
+                try:
+                    with open("debug_kramdown.txt", "w", encoding="utf-8") as _df:
+                        _df.write(f"# doc_name: {name}\n")
+                        _df.write(f"# doc_id: {doc_id}\n")
+                        _df.write(f"# title: {title}\n")
+                        _df.write("# ---- raw kramdown begin ----\n")
+                        _df.write(md)
+                        _df.write("\n# ---- raw kramdown end ----\n")
+                    print(f"   🐞 [DEBUG] 已将首个文档原始 Kramdown 写入 debug_kramdown.txt（{len(md)} 字符）")
+                except Exception as _e:
+                    print(f"   ⚠️  [DEBUG] 写入 debug_kramdown.txt 失败: {_e}")
+                _debug_kramdown_written = True
 
             # 通过 Markdown 表格中的练习日期判断是否需要跳过
             latest_date = parse_latest_date(md) if md else None

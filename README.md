@@ -221,6 +221,8 @@ python siyuan_client.py
 4. 在所有候选目录中按文件名搜索
 5. 完整 `/data/...` 路径替换
 
+> 🛟 **API 兜底（v2.4 新增）**：若以上本地路径全部失败（例如 `SIYUAN_DATA_PATH` 配置错误、目录不存在或与新版思源不一致），脚本会自动改用思源接口 `POST /api/file/getFile`（资源路径为 `/data/assets/{filename}`）直接拉取图片字节，并以内嵌 `data:image/...;base64,...` 的形式写入 HTML。这样即使本机没有挂载思源 data 目录，题目/答案卡片中的图片依然能正常渲染，不会再出现“卡片正文为空”的情况。
+
 ---
 
 ## 🎨 排版特性
@@ -286,11 +288,11 @@ sudo dnf install google-noto-sans-cjk-fonts wqy-microhei-fonts
 - 检查 `SIYUAN_URL` 和端口（默认 6806）
 - 检查 `API_TOKEN` 是否正确
 
-### Q: 图片无法显示？
+### Q: 图片无法显示 / 卡片正文为空？
 
-- 确认 `SIYUAN_DATA_PATH` 指向正确的思源 data 目录
-- 检查图片文件是否在 `assets/` 目录下
-- 脚本会尝试多种路径策略，运行日志中有详细提示
+- 优先确认 `SIYUAN_DATA_PATH` 是否正确指向思源 data 目录（新版思源资源统一位于 `{data}/assets/`）
+- 若本机无法访问该目录也无需担心：v2.4 起会自动改用思源 API 拉取图片并以内嵌 `data:` URI 渲染
+- 若仍为空，可设置环境变量 `DEBUG_KRAMDOWN=1` 运行一次，把生成的 `debug_kramdown.txt` 中的真实 Kramdown 提供出来排查
 
 ### Q: PDF 生成失败或中文显示方块？
 
@@ -322,9 +324,19 @@ sudo dnf install google-noto-sans-cjk-fonts wqy-microhei-fonts
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| v2.4 | 2026-09 | 修复题目/答案正文为空的 Bug：新增图片 API 兜底（data: URI），强化 Kramdown/IAL 解析 |
 | v2.3 | 2026-06 | 升级错题抽取逻辑（排序、优先级、页数上限、近期排除） |
 | v2.2 | 2026-06 | 修复日期过滤：从 Markdown 表格提取真实练习日期 |
 | v2.1 | 2026-06 | 新增多项增强功能 |
+
+### v2.4 变更详情
+
+- **修复“题目/答案卡片正文为空”**：经排查，DS0050 中每道题的 `# 题目` 区块为**纯图片**（正文即截图，`text` 本就为空），真正的空卡片原因是 `SIYUAN_DATA_PATH`（`/mnt/d/siyuan/workspace/data`）在本机不存在，导致 `map_image_path()` 全部返回 `None`、图片未被渲染
+- **新增图片 API 兜底**：当本地路径映射失败时，自动调用思源 `POST /api/file/getFile`（资源路径 `/data/assets/{filename}`）拉取图片字节，并以内嵌 `data:image/...;base64,...` 形式写入 HTML，彻底摆脱对本地 data 目录的依赖
+- **高度/宽高比估算同步增强**：新增 `_get_pil_image()`，`estimate_compact_height()` 与 `is_compact_item()` 改为“本地优先、API 兜底”，在无本地 data 目录时也能按真实图片尺寸排版
+- **强化 Kramdown 解析**：新增 `_strip_ial()` / `_heading_text()` / `_is_question_heading()` / `_is_answer_heading()` / `_clean_md_line()` / `_extract_block()`，兼容思源新版在标题行尾附加 `{: id="..." updated="..."}`、独立成行的 IAL 块、行内 `>` 引用内的 IAL 行、以及孤立的 `>` 行
+- **解析更稳健**：`parse_question()` / `parse_answer()` 改为基于标题语义匹配（自动排除“扩展题目XX”），图片路径仍在 IAL 清洗之前提取，并轻微放宽图片正则以兼容 `<>` 包裹的路径
+- **调试开关**：新增环境变量 `DEBUG_KRAMDOWN=1`，启用后会把首个文档的原始 Kramdown 写入 `debug_kramdown.txt`（默认不写文件）
 
 ### v2.3 变更详情
 
