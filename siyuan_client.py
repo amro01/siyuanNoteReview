@@ -28,6 +28,9 @@ import math
 import html
 import io
 import base64
+import socket
+import subprocess
+import time
 import urllib.parse
 from datetime import datetime, timedelta
 
@@ -48,6 +51,251 @@ except ImportError:
 
 
 # ============================================================
+#  网络地址解析与连通性预检（WSL → Windows 宿主机）
+# ============================================================
+# 背景：WSL2 默认 NAT 模式下，Windows 宿主机地址 == WSL 的默认网关
+# （例如 172.20.0.1/20）。该网段会随 Windows 重启、休眠恢复、网络切换
+# （Wi-Fi / 有线 / VPN）而被重新分配，因此把地址硬编码进 config.json 会周期性失效。
+#
+# 失效时的表现是「连接静默超时」而非「连接被拒绝」：
+#   File ".../urllib3/util/connection.py", line 73, in create_connection
+#     sock.connect(sa)        ← SYN 无人应答 → requests.exceptions.ConnectTimeout
+# 所以这里在运行时动态解析宿主机地址，并用短超时 TCP 预检快速筛选候选。
+#
+# 注意：不要用 /etc/resolv.conf 的 nameserver 作为宿主机地址。新版 WSL 的
+# DNS 隧道会把 nameserver 设为 10.255.255.254，那是 DNS 代理而非宿主机。
+
+# ---- 网络相关默认值（load_config() 会用 config.json 覆盖）----
+SIYUAN_HOST_MODE = "auto"     # auto: 多候选自动探测；fixed: 仅用 config 中的地址
+CONNECT_TIMEOUT = 3           # TCP 建连超时（秒）
+READ_TIMEOUT = 30             # 响应读取超时（秒）
+CONNECT_RETRIES = 2           # 建连失败后的额外重试次数
+RETRY_BACKOFF = 0.5           # 重试退避基数（秒）：等待 = RETRY_BACKOFF * 2^attempt
+PROBE_TIMEOUT = 1.5           # 单个候选地址的 TCP 预检超时（秒）
+
+# ---- 运行时状态 ----
+SIYUAN_BASE = ""              # 解析出的实际基址，如 http://172.20.0.1:6806
+_SIYUAN_BASE_RESOLVED = False
+_ASSET_ERROR_LOGGED = set()   # 已告警过的图片路径，避免重复刷屏
+_ASSET_FETCH_FAILED = 0       # 图片经 API 兜底仍失败的累计次数
+_CONNECT_FAIL_STREAK = 0      # 连续建连失败次数
+_CONNECT_FAIL_BANNER_SHOWN = False
+
+# 复用同一个 Session：复用已建立的 TCP 连接，避免每个请求都重新三次握手
+SESSION = requests.Session()
+_SESSION_ADAPTER = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
+SESSION.mount("http://", _SESSION_ADAPTER)
+SESSION.mount("https://", _SESSION_ADAPTER)
+
+
+def reset_resolved_base():
+    """配置重载后使地址解析缓存失效，确保下一次调用重新探测。"""
+    global SIYUAN_BASE, _SIYUAN_BASE_RESOLVED
+    SIYUAN_BASE = ""
+    _SIYUAN_BASE_RESOLVED = False
+
+
+def _split_siyuan_url(url):
+    """
+    拆分 SIYUAN_URL 为 (scheme, host, port)。
+    host 允许写成 'auto' 占位符（如 http://auto:6806），表示完全交由自动探测决定。
+    """
+    try:
+        parts = urllib.parse.urlsplit(url if "://" in url else f"http://{url}")
+    except ValueError:
+        return "http", "", 6806
+
+    scheme = parts.scheme or "http"
+    host = (parts.hostname or "").strip()
+    try:
+        port = parts.port or 6806
+    except ValueError:
+        port = 6806
+    return scheme, host, port
+
+
+def _detect_host_gateway():
+    """
+    从 /proc/net/route 解析默认网关地址（NAT 模式下即 Windows 宿主机）。
+
+    Gateway 字段为小端十六进制，例如 "010014AC" → 172.20.0.1。
+    纯文件读取，无子进程开销；解析失败返回 None。
+    """
+    try:
+        with open("/proc/net/route", "r", encoding="ascii") as f:
+            next(f, None)  # 跳过表头行
+            for line in f:
+                cols = line.split()
+                # Destination 为 00000000 表示默认路由
+                if len(cols) >= 3 and cols[1] == "00000000":
+                    gw_hex = cols[2]
+                    if len(gw_hex) == 8:
+                        octets = [str(int(gw_hex[i:i + 2], 16)) for i in (6, 4, 2, 0)]
+                        return ".".join(octets)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _detect_host_gateway_via_ip():
+    """/proc/net/route 不可用时的兜底：解析 `ip route show default` 输出。"""
+    try:
+        proc = subprocess.run(
+            ["ip", "-4", "route", "show", "default"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        m = re.search(r"default\s+via\s+(\d+\.\d+\.\d+\.\d+)", proc.stdout or "")
+        if m:
+            return m.group(1)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _tcp_probe(host, port, timeout=None):
+    """
+    短超时 TCP 预检：只判断能否建立连接，不发送任何业务数据。
+
+    以 PROBE_TIMEOUT（1.5s）级别的成本筛选候选地址，
+    避免每个失效候选都白等完整的 CONNECT_TIMEOUT。
+    """
+    probe_timeout = PROBE_TIMEOUT if timeout is None else timeout
+    try:
+        with socket.create_connection((host, port), timeout=probe_timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _candidate_hosts(configured_host):
+    """
+    生成候选宿主机地址（保持优先级顺序并去重）：
+      1. config.json 中显式配置的地址（为 auto 等占位符时跳过）
+      2. 127.0.0.1 / localhost（WSL1 或 mirrored 网络模式下可用）
+      3. 默认网关（WSL2 NAT 模式下的 Windows 宿主机）
+    """
+    placeholders = {"auto", "", "none", "default", "windows", "host.docker.internal"}
+    candidates = []
+    if configured_host and configured_host.lower() not in placeholders:
+        candidates.append(configured_host)
+    candidates.extend(["127.0.0.1", "localhost"])
+    gateway = _detect_host_gateway() or _detect_host_gateway_via_ip()
+    if gateway:
+        candidates.append(gateway)
+
+    seen, ordered = set(), []
+    for host in candidates:
+        if host and host not in seen:
+            seen.add(host)
+            ordered.append(host)
+    return ordered
+
+
+def resolve_siyuan_base(force=False, verbose=True):
+    """
+    解析并缓存实际可用的思源 API 基址。
+
+    返回基址字符串（如 http://172.20.0.1:6806）；
+    所有候选地址均不可达时返回 None，由调用方 fail-fast 并输出处置清单。
+    """
+    global SIYUAN_BASE, _SIYUAN_BASE_RESOLVED
+
+    if _SIYUAN_BASE_RESOLVED and not force:
+        return SIYUAN_BASE or None
+
+    scheme, configured_host, port = _split_siyuan_url(SIYUAN_URL)
+
+    if str(SIYUAN_HOST_MODE).lower() == "fixed":
+        candidates = [configured_host or "127.0.0.1"]
+        if verbose:
+            print("🌐 地址模式: fixed（仅使用 config.json 中的地址，不做自动探测）")
+    else:
+        candidates = _candidate_hosts(configured_host)
+
+    gateway = _detect_host_gateway() or _detect_host_gateway_via_ip()
+
+    for host in candidates:
+        if _tcp_probe(host, port):
+            SIYUAN_BASE = f"{scheme}://{host}:{port}"
+            _SIYUAN_BASE_RESOLVED = True
+            if verbose:
+                tag = "  ← 默认网关（NAT 模式下的 Windows 宿主机）" if host == gateway else ""
+                print(f"🌐 思源 API 可达: {SIYUAN_BASE}{tag}")
+            return SIYUAN_BASE
+        if verbose:
+            print(f"   ⚠️  候选地址不可达: {host}:{port}（{PROBE_TIMEOUT}s TCP 预检未通过）")
+
+    SIYUAN_BASE = ""
+    _SIYUAN_BASE_RESOLVED = True  # 已探测过，避免每次调用重复探测
+    return None
+
+
+def get_siyuan_base():
+    """获取基址；尚未解析时先解析（防御性懒加载），全部失败则回退到配置值。"""
+    if not _SIYUAN_BASE_RESOLVED:
+        resolve_siyuan_base()
+    return SIYUAN_BASE or SIYUAN_URL.rstrip("/")
+
+
+def _note_connect_failure():
+    """连续建连失败达 3 次时打印一次处置提示，避免逐条请求刷屏。"""
+    global _CONNECT_FAIL_STREAK, _CONNECT_FAIL_BANNER_SHOWN
+    _CONNECT_FAIL_STREAK += 1
+    if _CONNECT_FAIL_STREAK >= 3 and not _CONNECT_FAIL_BANNER_SHOWN:
+        _CONNECT_FAIL_BANNER_SHOWN = True
+        print("\n" + "!" * 60)
+        print("❗ 连续 3 次无法建立 TCP 连接。若此前可正常使用，常见原因与处置：")
+        print("   1) WSL NAT 网关地址漂移 → 保持 SIYUAN_HOST_MODE 为 auto（默认自动探测）")
+        print("   2) 宿主机休眠/唤醒后 NAT 端点失效 → Windows 侧执行 wsl --shutdown 后重开 WSL")
+        print("   3) 防火墙 profile 变为 Public → 放行规则需使用 -Profile Any")
+        print("   4) Wi-Fi/有线/VPN 切换导致 vNIC 重建 → 重新运行本脚本即可自动重新解析")
+        print("   提示：ping 不通宿主机属 WSL2 正常现象，判断链路请用 TCP 探测。")
+        print("!" * 60 + "\n")
+
+
+def _post_json(url, payload, headers=None, connect_timeout=None,
+               read_timeout=None, retries=None):
+    """
+    带「建连阶段」重试的 POST 封装。
+
+    重试安全性说明（重要）：
+      - 仅对建连阶段失败（ConnectTimeout / ConnectionError，即 TCP 尚未建立）重试。
+        此时一个字节都未发出，服务端无任何副作用，故对 POST 也是安全的。
+      - ReadTimeout（连接已建立但响应超时）不重试 —— 请求可能已送达并正在执行，
+        重放会导致重复操作。
+    本脚本调用的接口（/api/query/sql、getBlockKramdown、getHPathByID 等）均为只读查询，
+    这里仍按最严格原则处理，避免日后新增写接口时被静默重放。
+    """
+    c_timeout = CONNECT_TIMEOUT if connect_timeout is None else connect_timeout
+    r_timeout = READ_TIMEOUT if read_timeout is None else read_timeout
+    max_retries = CONNECT_RETRIES if retries is None else retries
+
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            return SESSION.post(
+                url,
+                headers=HEADERS if headers is None else headers,
+                json=payload,
+                timeout=(c_timeout, r_timeout),
+            )
+        except requests.exceptions.ReadTimeout:
+            raise  # 连接已建立，不可重放
+        except (requests.exceptions.ConnectTimeout,
+                requests.exceptions.ConnectionError) as e:
+            last_error = e
+            if attempt >= max_retries:
+                break
+            wait = RETRY_BACKOFF * (2 ** attempt)
+            print(f"   🔁 建连失败（第 {attempt + 1}/{max_retries} 次重试，等待 {wait:.1f}s）: {e}")
+            time.sleep(wait)
+
+    if last_error is not None:
+        raise last_error
+    raise requests.exceptions.ConnectionError(url)
+
+
+# ============================================================
 #  配置加载
 # ============================================================
 def load_config(config_path="config.json"):
@@ -58,6 +306,9 @@ def load_config(config_path="config.json"):
     新增配置项（兼容旧文件，自动设置默认值）：
       - MAX_PAGES: 最大页数限制（默认 10）
       - EXCLUDE_RECENT_DAYS: 排除最近几天内录入/复习的题目（默认 2）
+      - SIYUAN_HOST_MODE: 宿主机地址解析模式 auto/fixed（默认 auto）
+      - CONNECT_TIMEOUT / READ_TIMEOUT: 建连 / 读取超时秒数（默认 3 / 30）
+      - CONNECT_RETRIES / RETRY_BACKOFF: 建连重试次数与退避基数（默认 2 / 0.5）
     """
     if not os.path.isfile(config_path):
         print(f"❌ 未找到配置文件 {config_path}")
@@ -71,6 +322,7 @@ def load_config(config_path="config.json"):
     # 将配置注入模块全局变量
     global SIYUAN_URL, API_TOKEN, NOTEBOOK_ID, SIYUAN_DATA_PATH
     global TARGET_FOLDERS, SCORE_THRESHOLD, MIN_PAGES, MAX_PAGES, EXCLUDE_RECENT_DAYS, HEADERS
+    global SIYUAN_HOST_MODE, CONNECT_TIMEOUT, READ_TIMEOUT, CONNECT_RETRIES, RETRY_BACKOFF
 
     SIYUAN_URL = cfg["SIYUAN_URL"]
     API_TOKEN = cfg["API_TOKEN"]
@@ -85,10 +337,25 @@ def load_config(config_path="config.json"):
     # 新增配置：排除最近几天的题目，默认 2 天
     EXCLUDE_RECENT_DAYS = cfg.get("EXCLUDE_RECENT_DAYS", 2)
 
+    # 网络相关配置（兼容旧配置文件，缺失时使用模块默认值）
+    # auto : 依次探测 [配置地址, 127.0.0.1, localhost, 默认网关]，自动适配 NAT / mirrored 模式
+    # fixed: 仅使用 SIYUAN_URL 中的地址，不做自动探测
+    SIYUAN_HOST_MODE = str(cfg.get("SIYUAN_HOST_MODE", "auto")).strip().lower()
+    if SIYUAN_HOST_MODE not in ("auto", "fixed"):
+        print(f"⚠️  未知的 SIYUAN_HOST_MODE={SIYUAN_HOST_MODE!r}，已回退为 auto")
+        SIYUAN_HOST_MODE = "auto"
+    CONNECT_TIMEOUT = float(cfg.get("CONNECT_TIMEOUT", 3))    # TCP 建连超时（秒）
+    READ_TIMEOUT = float(cfg.get("READ_TIMEOUT", 30))         # 响应读取超时（秒）
+    CONNECT_RETRIES = int(cfg.get("CONNECT_RETRIES", 2))      # 建连重试次数
+    RETRY_BACKOFF = float(cfg.get("RETRY_BACKOFF", 0.5))      # 重试退避基数（秒）
+
     HEADERS = {
         "Authorization": f"Token {API_TOKEN}",
         "Content-Type": "application/json"
     }
+
+    # 配置变更后使地址解析缓存失效，确保下次调用重新探测
+    reset_resolved_base()
 
 
 # 脚本入口时自动加载配置
@@ -99,19 +366,39 @@ load_config()
 #  通用 API 调用
 # ============================================================
 def call_api(endpoint, payload=None):
-    url = f"{SIYUAN_URL}{endpoint}"
+    """
+    通用 API 调用。
+
+    异常分类说明：ConnectTimeout 在 requests 中同时是 Timeout 与 ConnectionError
+    的子类，若先捕获 Timeout 就会被误报为「请求超时」，从而掩盖真实的「连不上」。
+    因此这里按 ConnectTimeout → ReadTimeout → ConnectionError 的顺序精确区分。
+    """
+    global _CONNECT_FAIL_STREAK
+
+    base = get_siyuan_base()
+    url = f"{base}{endpoint}"
     try:
-        resp = requests.post(url, headers=HEADERS, json=payload, timeout=10)
+        resp = _post_json(url, payload)
+        _CONNECT_FAIL_STREAK = 0
         if resp.status_code != 200:
             return {"code": -1, "msg": f"HTTP {resp.status_code}: {resp.text}"}
         data = resp.json()
         if data.get("code") != 0:
             return {"code": data.get("code", -1), "msg": data.get("msg", "未知错误")}
         return data
-    except requests.exceptions.Timeout:
-        return {"code": -1, "msg": "请求超时"}
-    except requests.exceptions.ConnectionError:
-        return {"code": -1, "msg": f"无法连接到 {SIYUAN_URL}"}
+    except requests.exceptions.ConnectTimeout:
+        _note_connect_failure()
+        return {"code": -1, "msg": (
+            f"无法建立到 {base} 的 TCP 连接（建连超时 {CONNECT_TIMEOUT}s，"
+            f"已重试 {CONNECT_RETRIES} 次）—— 请检查 WSL 网关漂移 / 防火墙 / 宿主机是否休眠"
+        )}
+    except requests.exceptions.ReadTimeout:
+        return {"code": -1, "msg": (
+            f"连接已建立但思源在 {READ_TIMEOUT}s 内未响应（读取超时）: {endpoint}"
+        )}
+    except requests.exceptions.ConnectionError as e:
+        _note_connect_failure()
+        return {"code": -1, "msg": f"无法连接到 {base}（连接被拒绝或中断）: {e}"}
     except json.JSONDecodeError:
         return {"code": -1, "msg": "返回非 JSON 格式"}
     except Exception as e:
@@ -715,20 +1002,34 @@ def get_asset_bytes(api_image_path):
     当 SIYUAN_DATA_PATH 配置错误、目录不存在或与新版思源不一致时，
     仍能取到图片，从而修复“题目/答案卡片正文（含图片）为空”的问题。
 
+    与旧实现的区别：网络层失败不再被 `except Exception: continue` 静默吞掉，
+    而是打印一次告警，避免出现「图片无声丢失却毫无提示」的情况。
+
     返回 bytes，失败返回 None。
     """
+    global _ASSET_FETCH_FAILED
+
     if not api_image_path:
         return None
     if api_image_path in _ASSET_BYTES_CACHE:
         return _ASSET_BYTES_CACHE[api_image_path]
 
-    url = f"{SIYUAN_URL}/api/file/getFile"
+    url = f"{get_siyuan_base()}/api/file/getFile"
     result = None
+    network_error = None
+
     for cand in _asset_api_candidates(api_image_path):
         for payload_path in (f"/{cand}", cand):
             try:
-                resp = requests.post(url, headers=HEADERS, json={"path": payload_path}, timeout=15)
-            except Exception:
+                resp = _post_json(
+                    url,
+                    {"path": payload_path},
+                    connect_timeout=PROBE_TIMEOUT,
+                    read_timeout=READ_TIMEOUT,
+                    retries=0,  # 图片数量多，不做重试，避免整体变慢
+                )
+            except requests.exceptions.RequestException as e:
+                network_error = e
                 continue
             if resp.status_code == 200 and resp.content:
                 ctype = resp.headers.get("Content-Type", "")
@@ -739,8 +1040,23 @@ def get_asset_bytes(api_image_path):
         if result is not None:
             break
 
-    _ASSET_BYTES_CACHE[api_image_path] = result
-    return result
+    if result is not None:
+        _ASSET_BYTES_CACHE[api_image_path] = result
+        return result
+
+    _ASSET_FETCH_FAILED += 1
+    if api_image_path not in _ASSET_ERROR_LOGGED:
+        _ASSET_ERROR_LOGGED.add(api_image_path)
+        if network_error is not None:
+            print(f"   ⚠️  图片获取失败（网络层）: {api_image_path} — {network_error}")
+        else:
+            print(f"   ⚠️  图片获取失败（资源不存在或非图片）: {api_image_path}")
+
+    if network_error is None:
+        # 已取得确定的 HTTP 响应（资源不存在等）→ 负缓存，避免重复请求；
+        # 网络层失败不做负缓存，后续仍有机会重试成功。
+        _ASSET_BYTES_CACHE[api_image_path] = None
+    return None
 
 
 def _image_data_uri(api_image_path):
@@ -1381,6 +1697,30 @@ def main():
     print(f"   排除最近 {EXCLUDE_RECENT_DAYS} 天内新增/复习的题目")
     print()
 
+    # 0) 连通性预检（fail-fast）
+    #    先确认能连上思源，避免一路跑到 SQL 查询阶段才因超时失败，
+    #    也避免宿主机不可达时对每个文档重复等待完整的建连超时。
+    if resolve_siyuan_base() is None:
+        _scheme, _host, _port = _split_siyuan_url(SIYUAN_URL)
+        _probed = ", ".join(f"{h}:{_port}" for h in _candidate_hosts(_host))
+        print("❌ 无法连接到思源笔记 API，已提前终止。")
+        print(f"   配置地址: {SIYUAN_URL}（SIYUAN_HOST_MODE={SIYUAN_HOST_MODE}）")
+        print(f"   已探测候选: {_probed}")
+        print()
+        print("   排查清单：")
+        print("     1) 思源是否开启网络伺服（设置 → 关于 → 网络伺服），监听地址建议改为 0.0.0.0")
+        print("     2) Windows 防火墙入站放行 6806/TCP，且使用 -Profile Any")
+        print("        PowerShell(管理员): New-NetFirewallRule -DisplayName 'SiYuan 6806 (WSL)' "
+              "-Direction Inbound -Protocol TCP -LocalPort 6806 -Action Allow -Profile Any")
+        print("     3) 如需彻底摆脱网关漂移：在 %USERPROFILE%\\.wslconfig 增加 [wsl2] "
+              "networkingMode=mirrored，再执行 wsl --shutdown")
+        print("     4) 休眠/唤醒后 NAT 端点可能失效：Windows 侧执行 wsl --shutdown 后重开 WSL")
+        print("     注意：ping 不通宿主机是 WSL2 正常现象，判断链路请用 TCP 探测。")
+        sys.exit(1)
+
+    print(f"🔗 链路已就绪，超时配置: 建连 {CONNECT_TIMEOUT}s / 读取 {READ_TIMEOUT}s，"
+          f"建连重试 {CONNECT_RETRIES} 次\n")
+
     # 1) 查找目录
     target_dirs = find_target_dirs()
     if not target_dirs:
@@ -1492,6 +1832,9 @@ def main():
     print(f"   练习卷: {practice_pdf}")
     print(f"   答案卷: {answer_pdf}")
     print(f"   估算 ~{estimate_total_pages(selected)} 页 (A4)")
+    if _ASSET_FETCH_FAILED:
+        print(f"   ⚠️  有 {_ASSET_FETCH_FAILED} 处图片未能获取（详见上方告警；"
+              f"请检查 SIYUAN_DATA_PATH 与网络连通性）")
     if not success or not success2:
         print(f"\n⚠️  部分 PDF 文件编译失败，请检查上述错误信息。")
     print(f"{'=' * 60}")

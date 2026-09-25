@@ -1,5 +1,6 @@
 {
     "SIYUAN_URL": "http://YOUR_WINDOWS_IP:6806",
+    "SIYUAN_HOST_MODE": "auto",
     "API_TOKEN": "YOUR_API_TOKEN",
     "NOTEBOOK_ID": "YOUR_NOTEBOOK_ID",
     "SIYUAN_DATA_PATH": "/path/to/siyuan/workspace/data",
@@ -7,5 +8,9 @@
     "SCORE_THRESHOLD": 3,
     "MIN_PAGES": 2,
     "MAX_PAGES": 10,
-    "EXCLUDE_RECENT_DAYS": 2
+    "EXCLUDE_RECENT_DAYS": 2,
+    "CONNECT_TIMEOUT": 3,
+    "READ_TIMEOUT": 30,
+    "CONNECT_RETRIES": 2,
+    "RETRY_BACKOFF": 0.5
 }

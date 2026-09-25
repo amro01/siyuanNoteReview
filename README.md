@@ -55,6 +55,7 @@ cp config.json.example config.json
 ```json
 {
     "SIYUAN_URL": "http://YOUR_WINDOWS_IP:6806",
+    "SIYUAN_HOST_MODE": "auto",
     "API_TOKEN": "YOUR_API_TOKEN",
     "NOTEBOOK_ID": "YOUR_NOTEBOOK_ID",
     "SIYUAN_DATA_PATH": "/path/to/siyuan/workspace/data",
@@ -62,7 +63,11 @@ cp config.json.example config.json
     "SCORE_THRESHOLD": 3,
     "MIN_PAGES": 2,
     "MAX_PAGES": 10,
-    "EXCLUDE_RECENT_DAYS": 2
+    "EXCLUDE_RECENT_DAYS": 2,
+    "CONNECT_TIMEOUT": 3,
+    "READ_TIMEOUT": 30,
+    "CONNECT_RETRIES": 2,
+    "RETRY_BACKOFF": 0.5
 }
 ```
 
@@ -70,7 +75,8 @@ cp config.json.example config.json
 
 | 参数 | 说明 |
 |------|------|
-| `SIYUAN_URL` | 思源笔记 API 地址（默认端口 6806） |
+| `SIYUAN_URL` | 思源笔记 API 地址（默认端口 6806）；写死的 IP 会作为「首选候选」参与自动探测 |
+| `SIYUAN_HOST_MODE` | `auto`（默认）按「配置地址 → 127.0.0.1 → localhost → 默认网关」自动探测；`fixed` 则只用配置地址 |
 | `API_TOKEN` | 从思源设置 → API Token 获取 |
 | `NOTEBOOK_ID` | 目标笔记本 ID |
 | `SIYUAN_DATA_PATH` | 思源 data 目录的**物理路径**，用于读取图片文件 |
@@ -79,6 +85,10 @@ cp config.json.example config.json
 | `MIN_PAGES` | 练习卷最少估算页数，不足时从困难池补充 |
 | `MAX_PAGES` | 练习卷最大页数限制，超过此值时停止添加新题（默认 10） |
 | `EXCLUDE_RECENT_DAYS` | 排除最近 N 天内录入/复习的题目，从 Markdown 表格日期列判断（默认 2） |
+| `CONNECT_TIMEOUT` | TCP 建连超时秒数（默认 3）；超时会导致 `ConnectTimeout`，即 WSL 场景下的静默超时 |
+| `READ_TIMEOUT` | 响应读取超时秒数（默认 30）；连接已建立但思源响应缓慢时触发 |
+| `CONNECT_RETRIES` | 建连失败后的重试次数（默认 2），仅重试建连阶段 |
+| `RETRY_BACKOFF` | 重试退避基数秒数（默认 0.5），实际等待 = 基数 × 2^重试序号 |
 
 > ⚠️ **安全提醒**：`config.json` 包含你的 API Token 等敏感信息，已默认加入 `.gitignore`，请勿将其提交到代码仓库。
 
@@ -186,7 +196,8 @@ python siyuan_client.py
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `SIYUAN_URL` | `http://YOUR_WINDOWS_IP:6806` | 思源笔记 API 地址 |
+| `SIYUAN_URL` | `http://YOUR_WINDOWS_IP:6806` | 思源笔记 API 地址（作为自动探测的首选候选） |
+| `SIYUAN_HOST_MODE` | `auto` | 地址解析模式：`auto` 自动探测 / `fixed` 仅用配置地址 |
 | `API_TOKEN` | — | 从思源设置 → API Token 获取 |
 | `NOTEBOOK_ID` | — | 目标笔记本 ID，从思源 WebSocket 或文件树获取 |
 | `SIYUAN_DATA_PATH` | — | 思源 data 目录的**物理路径**，用于读取图片文件 |
@@ -195,6 +206,10 @@ python siyuan_client.py
 | `MIN_PAGES` | `2` | 练习卷最少估算页数，不足时从困难池补充 |
 | `MAX_PAGES` | `10` | 练习卷最大页数限制，超过此值时停止添加新题 |
 | `EXCLUDE_RECENT_DAYS` | `2` | 排除最近 N 天内录入/复习的题目，从表格日期列判断 |
+| `CONNECT_TIMEOUT` | `3` | TCP 建连超时秒数 |
+| `READ_TIMEOUT` | `30` | 响应读取超时秒数 |
+| `CONNECT_RETRIES` | `2` | 建连失败重试次数（仅建连阶段） |
+| `RETRY_BACKOFF` | `0.5` | 重试退避基数（秒），等待 = 基数 × 2^重试序号 |
 
 ---
 
@@ -222,6 +237,35 @@ python siyuan_client.py
 5. 完整 `/data/...` 路径替换
 
 > 🛟 **API 兜底（v2.4 新增）**：若以上本地路径全部失败（例如 `SIYUAN_DATA_PATH` 配置错误、目录不存在或与新版思源不一致），脚本会自动改用思源接口 `POST /api/file/getFile`（资源路径为 `/data/assets/{filename}`）直接拉取图片字节，并以内嵌 `data:image/...;base64,...` 的形式写入 HTML。这样即使本机没有挂载思源 data 目录，题目/答案卡片中的图片依然能正常渲染，不会再出现“卡片正文为空”的情况。
+
+---
+
+## 🌐 WSL2 网络与宿主机地址解析（v2.5）
+
+在 WSL2 默认 **NAT 模式**下，Windows 宿主机地址等于 WSL 的**默认网关**（例如 `172.20.0.1`）。
+该网段会随 **Windows 重启、休眠恢复、Wi-Fi/有线/VPN 切换** 被重新分配，
+因此把地址硬编码进 `config.json` 会周期性失效，表现为**连接静默超时**：
+
+```log
+File ".../urllib3/util/connection.py", line 73, in create_connection
+  sock.connect(sa)          ← SYN 无人应答 → ConnectTimeout（而非 ConnectionRefused）
+```
+
+v2.5 起脚本在启动时按以下优先级自动探测可用地址，并对每个候选做 **1.5s 级 TCP 预检**：
+
+| 优先级 | 候选地址 | 适用场景 |
+|--------|----------|----------|
+| 1 | `SIYUAN_URL` 中配置的地址 | 快速路径（地址仍有效时约 1.5s 内命中） |
+| 2 | `127.0.0.1` / `localhost` | WSL1，或 `.wslconfig` 开启 `networkingMode=mirrored` |
+| 3 | 默认网关 | WSL2 NAT 模式下的 Windows 宿主机 |
+
+要点：
+
+- 解析结果会缓存复用；**全部候选失败则 fail-fast 退出** 并打印排查清单，不会逐个文档重复等待超时
+- 仅对 **建连阶段** 失败重试（指数退避）；**读取超时不重试**，避免重放可能已送达并执行的请求
+- **不要**把 `/etc/resolv.conf` 的 `nameserver` 当作宿主机地址：新版 WSL 的 DNS 隧道会将其设为 `10.255.255.254`，那是 DNS 代理而非宿主机，连接必然超时
+- **ping 不通宿主机属 WSL2 正常现象**，判断链路请一律使用 TCP 探测
+- 若希望彻底摆脱网关漂移，可在 `%USERPROFILE%\.wslconfig` 增加 `[wsl2]` + `networkingMode=mirrored`，再执行 `wsl --shutdown`
 
 ---
 
@@ -288,6 +332,24 @@ sudo dnf install google-noto-sans-cjk-fonts wqy-microhei-fonts
 - 检查 `SIYUAN_URL` 和端口（默认 6806）
 - 检查 `API_TOKEN` 是否正确
 
+### Q: 报错「请求超时」/ 连接超时（WSL → Windows 宿主机）？
+
+脚本会自动探测宿主机地址并在启动时 fail-fast。若仍失败，按下面顺序排查：
+
+- 确认 `SIYUAN_HOST_MODE` 为 `auto`（默认值），脚本会自动回退到 WSL 默认网关
+- 思源「网络伺服」监听地址建议由 `127.0.0.1` 改为 `0.0.0.0`（改完需重启思源 Kernel 才生效）
+- Windows 防火墙需放行入站 `6806/TCP`，并使用 `-Profile Any`（WSL 网卡常被判为 Public）：
+
+  ```powershell
+  New-NetFirewallRule -DisplayName "SiYuan 6806 (WSL)" -Direction Inbound `
+    -Protocol TCP -LocalPort 6806 -Action Allow -Profile Any
+  ```
+
+- 休眠/唤醒后 WSL NAT 端点可能失效：Windows 侧执行 `wsl --shutdown` 后重开 WSL
+- 看错误文案区分层次：「无法建立到 ... 的 TCP 连接」= 网络层问题（地址/防火墙）；
+  「读取超时」= 连接已建立但思源响应慢（多为正在建索引或文档过大），可调大 `READ_TIMEOUT`
+- 不要用 `ping` 判断连通性：WSL2 下 ping 不通宿主机属正常现象，请使用 TCP 探测
+
 ### Q: 图片无法显示 / 卡片正文为空？
 
 - 优先确认 `SIYUAN_DATA_PATH` 是否正确指向思源 data 目录（新版思源资源统一位于 `{data}/assets/`）
@@ -324,14 +386,30 @@ sudo dnf install google-noto-sans-cjk-fonts wqy-microhei-fonts
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| v2.5 | 2026-09 | 根治 WSL→Windows 宿主机「连接超时」：运行时地址解析、TCP 预检、超时拆分与建连重试、异常分类修正、fail-fast |
 | v2.4 | 2026-09 | 修复题目/答案正文为空的 Bug：新增图片 API 兜底（data: URI），强化 Kramdown/IAL 解析 |
 | v2.3 | 2026-06 | 升级错题抽取逻辑（排序、优先级、页数上限、近期排除） |
 | v2.2 | 2026-06 | 修复日期过滤：从 Markdown 表格提取真实练习日期 |
 | v2.1 | 2026-06 | 新增多项增强功能 |
 
+### v2.5 变更详情
+
+- **根治 WSL → Windows 宿主机「连接超时」**：WSL2 NAT 模式下宿主机地址等于 WSL 默认网关，该网段会随 Windows 重启、休眠恢复、Wi-Fi/VPN 切换而漂移；此前地址硬编码在 `config.json`，失效时表现为 `sock.connect` 静默超时（`ConnectTimeout`，而非 `ConnectionRefused`）
+- **新增运行时地址解析**：新增 `SIYUAN_HOST_MODE`（`auto` / `fixed`），`auto` 模式按「配置地址 → 127.0.0.1 → localhost → 默认网关」顺序探测，结果缓存复用
+- **新增默认网关探测**：`_detect_host_gateway()` 直接解析 `/proc/net/route`（纯文件读取、无子进程开销），并以 `ip route show default` 作为兜底
+- **新增 1.5s TCP 预检**：`_tcp_probe()` 以极低成本快速筛掉失效候选，避免每个候选都白等完整的建连超时
+- **超时拆分**：`timeout=10` 改为 `(CONNECT_TIMEOUT, READ_TIMEOUT)` 元组（默认 `3` / `30`，均可配置）
+- **建连重试与退避**：建连失败按 `RETRY_BACKOFF × 2^n` 指数退避重试（默认 2 次）
+- **重试安全性边界**：仅重试建连阶段失败（TCP 尚未建立、一个字节都未发出，故对 POST 也安全）；`ReadTimeout` 不重试，避免重放可能已送达并执行的请求
+- **修正误导性异常分类**：`ConnectTimeout` 同时是 `Timeout` 与 `ConnectionError` 的子类，旧实现先捕获 `Timeout`，导致一律显示「请求超时」而掩盖真实原因；现按 `ConnectTimeout` → `ReadTimeout` → `ConnectionError` 顺序精确区分，并在文案中给出 `host:port` 与处置建议
+- **启动 fail-fast**：`main()` 开头即做连通性预检，失败时打印排查清单并退出，不再逐个文档重复等待超时；运行中连续 3 次建连失败会打印一次汇总提示
+- **修复图片静默吞错**：`get_asset_bytes()` 不再 `except Exception: continue`；网络层失败会告警且不写入负缓存（保留后续重试机会），仅确定性的「资源不存在」才做负缓存，并在收尾统计中汇总失败数量
+- **Session 复用**：`call_api()` 改用共享 `requests.Session` + `HTTPAdapter` 连接池，避免每个请求重新三次握手
+- **新增配置项**：`SIYUAN_HOST_MODE`、`CONNECT_TIMEOUT`、`READ_TIMEOUT`、`CONNECT_RETRIES`、`RETRY_BACKOFF`（均有默认值，旧配置文件可直接沿用）
+
 ### v2.4 变更详情
 
-- **修复“题目/答案卡片正文为空”**：经排查，DS0050 中每道题的 `# 题目` 区块为**纯图片**（正文即截图，`text` 本就为空），真正的空卡片原因是 `SIYUAN_DATA_PATH`（`/mnt/d/siyuan/workspace/data`）在本机不存在，导致 `map_image_path()` 全部返回 `None`、图片未被渲染
+- **修复“题目/答案卡片正文为空”**：经排查，DS0050 中每道题的 `# 题目` 区块为**纯图片**（正文即截图，`text` 本就为空），真正的空卡片原因是 `SIYUAN_DATA_PATH`（`/path/to/siyuan/workspace/data`）在本机不存在，导致 `map_image_path()` 全部返回 `None`、图片未被渲染
 - **新增图片 API 兜底**：当本地路径映射失败时，自动调用思源 `POST /api/file/getFile`（资源路径 `/data/assets/{filename}`）拉取图片字节，并以内嵌 `data:image/...;base64,...` 形式写入 HTML，彻底摆脱对本地 data 目录的依赖
 - **高度/宽高比估算同步增强**：新增 `_get_pil_image()`，`estimate_compact_height()` 与 `is_compact_item()` 改为“本地优先、API 兜底”，在无本地 data 目录时也能按真实图片尺寸排版
 - **强化 Kramdown 解析**：新增 `_strip_ial()` / `_heading_text()` / `_is_question_heading()` / `_is_answer_heading()` / `_clean_md_line()` / `_extract_block()`，兼容思源新版在标题行尾附加 `{: id="..." updated="..."}`、独立成行的 IAL 块、行内 `>` 引用内的 IAL 行、以及孤立的 `>` 行
