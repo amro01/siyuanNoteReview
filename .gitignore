@@ -24,3 +24,5 @@ dist/
 .ipynb_checkpoints/
 .idea/
 .DS_Store
+# 重构基线产物：仅提交 BASELINE.md 签名，日志为本地留存
+baseline/run.log

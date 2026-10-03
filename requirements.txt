@@ -1,0 +1,21 @@
+# ============================================================
+#  思源笔记 —— 错题拼卷机 运行依赖
+# ============================================================
+# 已在以下环境验证通过：
+#   conda 环境 note / Python 3.10.20
+#   requests 2.34.2 / Pillow 12.2.0 / weasyprint 69.0
+#
+# 安装（推荐使用项目的 conda 环境 note）：
+#   conda activate note
+#   pip install -r requirements.txt
+#
+# 备注：
+#   - weasyprint 用于将 HTML 编译为 PDF；在 Linux 上依赖系统库
+#     pango / cairo（Debian/Ubuntu: libpango-1.0-0 libcairo2），
+#     以及中文字体（fonts-noto-cjk / fonts-wqy-microhei）。
+#   - Pillow 缺失时程序会降级为保守的紧凑排版判断，不会中断。
+# ============================================================
+
+requests>=2.31.0
+Pillow>=10.0.0
+weasyprint>=62.0
