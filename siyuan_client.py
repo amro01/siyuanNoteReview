@@ -34,6 +34,9 @@ import time
 import urllib.parse
 from datetime import datetime, timedelta
 
+# 步骤1：配置迁移到独立模块（Config 数据类 + 单例），本模块保留兼容 shim
+import config as config_module
+
 try:
     from PIL import Image
     _HAS_PIL = True
@@ -72,6 +75,20 @@ READ_TIMEOUT = 30             # 响应读取超时（秒）
 CONNECT_RETRIES = 2           # 建连失败后的额外重试次数
 RETRY_BACKOFF = 0.5           # 重试退避基数（秒）：等待 = RETRY_BACKOFF * 2^attempt
 PROBE_TIMEOUT = 1.5           # 单个候选地址的 TCP 预检超时（秒）
+
+# ---- 其余配置项默认值（由 load_config() 从 config.json 显式填充）----
+# 步骤1：为消除导入期副作用，这里先给出安全默认值，
+#        使得 `import siyuan_client` 不再触发读取 config.json。
+SIYUAN_URL = ""
+API_TOKEN = ""
+NOTEBOOK_ID = ""
+SIYUAN_DATA_PATH = ""
+TARGET_FOLDERS = []
+SCORE_THRESHOLD = 3
+MIN_PAGES = 2
+MAX_PAGES = 10
+EXCLUDE_RECENT_DAYS = 2
+HEADERS = {}
 
 # ---- 运行时状态 ----
 SIYUAN_BASE = ""              # 解析出的实际基址，如 http://172.20.0.1:6806
@@ -300,66 +317,44 @@ def _post_json(url, payload, headers=None, connect_timeout=None,
 # ============================================================
 def load_config(config_path="config.json"):
     """
-    从 config.json 加载配置，并将变量设置到模块全局作用域。
-    如果文件不存在，给出友好提示并退出。
+    加载配置并同步到本模块全局变量（迁移期兼容 shim）。
 
-    新增配置项（兼容旧文件，自动设置默认值）：
-      - MAX_PAGES: 最大页数限制（默认 10）
-      - EXCLUDE_RECENT_DAYS: 排除最近几天内录入/复习的题目（默认 2）
-      - SIYUAN_HOST_MODE: 宿主机地址解析模式 auto/fixed（默认 auto）
-      - CONNECT_TIMEOUT / READ_TIMEOUT: 建连 / 读取超时秒数（默认 3 / 30）
-      - CONNECT_RETRIES / RETRY_BACKOFF: 建连重试次数与退避基数（默认 2 / 0.5）
+    步骤1 说明：
+      - 真正的解析逻辑已迁移至 [`config.py`](config.py) 的 Config / load_config；
+      - 本函数保留原名称与原全局变量名，把 Config 的字段回填到模块全局作用域，
+        使其余函数仍可按旧方式读取 SIYUAN_URL / TARGET_FOLDERS / HEADERS 等，
+        从而在不改动业务逻辑的前提下完成迁移；
+      - 本函数**不再在模块导入时自动执行**（原第 362 行的裸调用已删除），
+        改由 main() 显式调用，消除导入期副作用。
     """
-    if not os.path.isfile(config_path):
-        print(f"❌ 未找到配置文件 {config_path}")
-        print("   请复制 config.json.example 为 config.json，并填写你的实际配置。")
-        print("   参考命令: cp config.json.example config.json")
-        sys.exit(1)
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-
-    # 将配置注入模块全局变量
     global SIYUAN_URL, API_TOKEN, NOTEBOOK_ID, SIYUAN_DATA_PATH
     global TARGET_FOLDERS, SCORE_THRESHOLD, MIN_PAGES, MAX_PAGES, EXCLUDE_RECENT_DAYS, HEADERS
     global SIYUAN_HOST_MODE, CONNECT_TIMEOUT, READ_TIMEOUT, CONNECT_RETRIES, RETRY_BACKOFF
+    global PROBE_TIMEOUT
 
-    SIYUAN_URL = cfg["SIYUAN_URL"]
-    API_TOKEN = cfg["API_TOKEN"]
-    NOTEBOOK_ID = cfg["NOTEBOOK_ID"]
-    SIYUAN_DATA_PATH = cfg["SIYUAN_DATA_PATH"]
-    TARGET_FOLDERS = cfg["TARGET_FOLDERS"]
-    SCORE_THRESHOLD = cfg["SCORE_THRESHOLD"]
-    MIN_PAGES = cfg["MIN_PAGES"]
+    cfg = config_module.load_config(config_path)
+    config_module.set_config(cfg)
 
-    # 新增配置：最大页数限制，默认 10
-    MAX_PAGES = cfg.get("MAX_PAGES", 10)
-    # 新增配置：排除最近几天的题目，默认 2 天
-    EXCLUDE_RECENT_DAYS = cfg.get("EXCLUDE_RECENT_DAYS", 2)
-
-    # 网络相关配置（兼容旧配置文件，缺失时使用模块默认值）
-    # auto : 依次探测 [配置地址, 127.0.0.1, localhost, 默认网关]，自动适配 NAT / mirrored 模式
-    # fixed: 仅使用 SIYUAN_URL 中的地址，不做自动探测
-    SIYUAN_HOST_MODE = str(cfg.get("SIYUAN_HOST_MODE", "auto")).strip().lower()
-    if SIYUAN_HOST_MODE not in ("auto", "fixed"):
-        print(f"⚠️  未知的 SIYUAN_HOST_MODE={SIYUAN_HOST_MODE!r}，已回退为 auto")
-        SIYUAN_HOST_MODE = "auto"
-    CONNECT_TIMEOUT = float(cfg.get("CONNECT_TIMEOUT", 3))    # TCP 建连超时（秒）
-    READ_TIMEOUT = float(cfg.get("READ_TIMEOUT", 30))         # 响应读取超时（秒）
-    CONNECT_RETRIES = int(cfg.get("CONNECT_RETRIES", 2))      # 建连重试次数
-    RETRY_BACKOFF = float(cfg.get("RETRY_BACKOFF", 0.5))      # 重试退避基数（秒）
-
-    HEADERS = {
-        "Authorization": f"Token {API_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    SIYUAN_URL = cfg.siyuan_url
+    API_TOKEN = cfg.api_token
+    NOTEBOOK_ID = cfg.notebook_id
+    SIYUAN_DATA_PATH = cfg.siyuan_data_path
+    TARGET_FOLDERS = cfg.target_folders
+    SCORE_THRESHOLD = cfg.score_threshold
+    MIN_PAGES = cfg.min_pages
+    MAX_PAGES = cfg.max_pages
+    EXCLUDE_RECENT_DAYS = cfg.exclude_recent_days
+    SIYUAN_HOST_MODE = cfg.siyuan_host_mode
+    CONNECT_TIMEOUT = cfg.connect_timeout
+    READ_TIMEOUT = cfg.read_timeout
+    CONNECT_RETRIES = cfg.connect_retries
+    RETRY_BACKOFF = cfg.retry_backoff
+    PROBE_TIMEOUT = cfg.probe_timeout
+    HEADERS = cfg.headers
 
     # 配置变更后使地址解析缓存失效，确保下次调用重新探测
     reset_resolved_base()
-
-
-# 脚本入口时自动加载配置
-load_config()
+    return cfg
 
 
 # ============================================================
@@ -1678,6 +1673,9 @@ def compile_html_to_pdf(html_content, output_pdf_path):
 #  主流程
 # ============================================================
 def main():
+    # 步骤1：配置改为显式加载，消除模块导入期副作用
+    load_config()
+
     now = datetime.now()
     current_time_str = now.strftime('%Y-%m-%d %H:%M')
     file_time_str = now.strftime('%Y%m%d_%H%M')
