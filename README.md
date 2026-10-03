@@ -95,6 +95,10 @@ cp config.json.example config.json
 ### 2. 运行
 
 ```bash
+# 推荐：以 main.py 作为编排入口
+python main.py
+
+# 兼容：旧入口仍可用（内部转发到 main.py）
 python siyuan_client.py
 ```
 
@@ -386,11 +390,22 @@ sudo dnf install google-noto-sans-cjk-fonts wqy-microhei-fonts
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| v2.6 | 2026-10 | 单文件（1844 行）模块化重构为扁平 5 模块架构，依赖单向、行为 100% 保持不变 |
 | v2.5 | 2026-09 | 根治 WSL→Windows 宿主机「连接超时」：运行时地址解析、TCP 预检、超时拆分与建连重试、异常分类修正、fail-fast |
 | v2.4 | 2026-09 | 修复题目/答案正文为空的 Bug：新增图片 API 兜底（data: URI），强化 Kramdown/IAL 解析 |
 | v2.3 | 2026-06 | 升级错题抽取逻辑（排序、优先级、页数上限、近期排除） |
 | v2.2 | 2026-06 | 修复日期过滤：从 Markdown 表格提取真实练习日期 |
 | v2.1 | 2026-06 | 新增多项增强功能 |
+
+### v2.6 变更详情
+
+- **扁平 5 模块架构**：将原 1844 行单文件 `siyuan_client.py` 平滑拆分为 `main.py` / `renderer.py` / `parser.py` / `siyuan_api.py` / `config.py`
+- **严格单向依赖**：`main → renderer → parser → siyuan_api → config`，全程无循环导入
+- **消除导入期副作用**：`config.py` 引入 `Config` 数据类与单例，配置由 `main()` 显式加载并注入
+- **数据契约保持**：`QuestionDoc` / `QuestionItem` 采用 `NamedTuple`，完整保留元组下标契约（`item[4]`、7 元解包等旧写法继续可用）
+- **渲染层共享 CSS**：练习卷与答案卷共用的字体 / `*` / `body` / `.header` 样式抽为 `renderer._CSS_BASE`，仅去重、不改变声明覆盖顺序与渲染效果
+- **向后兼容**：`siyuan_client.py` 收敛为 3 行转发垫片（`from main import main`），旧调用点与旧习惯零感知
+- **回归验证**：端到端 88 扫描 / 56 跳过 / 28 选题（半栏 6 · 通栏 22）/ ~9 页 / 两份 PDF，归一化日志与基线 **0 行差异**
 
 ### v2.5 变更详情
 
@@ -444,15 +459,40 @@ sudo dnf install google-noto-sans-cjk-fonts wqy-microhei-fonts
 
 ## 📋 项目结构
 
+```text
+note/
+├── main.py                # 顶层编排：扫描 → 过滤 → 选题 → 重排 → 出卷 → 统计
+├── renderer.py            # 渲染层：CSS + HTML 拼装 + WeasyPrint PDF 编译
+├── parser.py              # 解析与规则：数据模型 + Markdown 解析 + 标题分类 + 版式估算 + 选题引擎
+├── siyuan_api.py          # 网络与仓储：地址探测 + HTTP 传输 + 思源领域端点 + 图片资源
+├── config.py              # 配置：Config 数据类 + config.json 加载 + 单例
+├── siyuan_client.py       # 兼容转发垫片（3 行，转发到 main.py）
+├── requirements.txt       # 显式依赖
+├── config.json.example    # 示例配置文件（不含真实数据）
+├── 数学练习模板04.md       # 错题文档模板（参考用）
+├── baseline/BASELINE.md   # 重构回归基线签名
+├── README.md              # 本文件
+└── .gitignore             # Git 忽略规则
 ```
-.
-├── config.json              # 配置文件（已加入 .gitignore，勿上传）
-├── config.json.example      # 示例配置文件（不含真实数据）
-├── siyuan_client.py         # 主程序：扫描、选题、生成 HTML/PDF
-├── 数学练习模板04.md         # 错题文档模板（参考用）
-├── README.md                # 本文件
-└── .gitignore               # Git 忽略规则
+
+> `config.json`（含敏感 Token）与实际产物 PDF / 日志已加入 `.gitignore`，不入库。
+
+### 依赖方向（严格单向，无循环导入）
+
+```text
+main → renderer → parser → siyuan_api → config
 ```
+
+### 各模块职责
+
+| 模块 | 职责 | 依赖 |
+|------|------|------|
+| [`main.py`](main.py:1) | 顶层编排；[`collect_documents()`](main.py:61) 负责连通性预检、目录扫描与日期过滤 | 全部 |
+| [`renderer.py`](renderer.py:1) | 一切产出物：HTML 工具、练习卷/答案卷 HTML 生成、PDF 编译（含共享 CSS 常量） | `parser`、`siyuan_api` |
+| [`parser.py`](parser.py:1) | 纯数据与规则：`QuestionDoc`/`QuestionItem`、Markdown 解析、标题分类、版式估算、选题引擎 | `config`、`siyuan_api` |
+| [`siyuan_api.py`](siyuan_api.py:1) | 一切与思源通信：地址解析、HTTP 传输、仓储端点、图片字节获取与 base64 兜底 | `config` |
+| [`config.py`](config.py:1) | 配置定义、加载、校验与单例（导入期零副作用） | 无 |
+| [`siyuan_client.py`](siyuan_client.py:1) | 兼容转发垫片，保证旧入口/旧调用点仍可用 | `main` |
 
 ---
 
