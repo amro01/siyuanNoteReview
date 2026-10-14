@@ -337,9 +337,11 @@ def _extract_block(content_lines):
     # 1) 先提取图片路径（在清理 {:...} 与 > 之前）
     image_paths = []
     for line in content_lines:
-        for m in re.finditer(r'!\[.*?\]\(\s*<?(/?)assets/([^)>\s]+)', line):
+        # 图片文件名可能包含空格（例如「屏幕截图 2026-10-14 193932-....png」），
+        # 因此路径字符类只排除右括号 / 右尖括号，不再排除空白，避免文件名被截断。
+        for m in re.finditer(r'!\[.*?\]\(\s*<?(/?)assets/([^)>]+)', line):
             prefix = "/" if m.group(1) else ""
-            full = f"{prefix}assets/{m.group(2)}"
+            full = f"{prefix}assets/{m.group(2).strip()}"
             if full not in image_paths:
                 image_paths.append(full)
 
