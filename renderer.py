@@ -155,13 +155,13 @@ def _html_build_question_body(item, idx, is_compact=False):
 def generate_html_practice(selected_items, current_time_str, target_folders_str):
     """
     生成 HTML 练习卷源码字符串。
-    使用 CSS Grid 双栏布局 + 通栏排版，保持原始题目顺序。
+    使用表格双栏布局 + 通栏排版，保持原始题目顺序。
 
     排版策略：
     - 按原始顺序遍历题目，保持题号连续
-    - 紧凑型（compact）题目两两配对放入 CSS Grid 双栏容器
+    - 紧凑型（compact）题目两两配对放入表格双栏容器（<table> 两列各 50%）
     - 常规型（normal）题目通栏排版
-    - 每道题目的容器使用 break-inside: avoid 防止跨页截断
+    - 每行题目使用 break-inside: avoid 防止跨页截断（约束上移至表格行 / 通栏容器）
     - 相比上一版的改进：不再将所有 compact/normal 分组，而是保持自然顺序
     """
     date_str = current_time_str[:10]
@@ -177,29 +177,43 @@ def generate_html_practice(selected_items, current_time_str, target_folders_str)
             color: #666;
         }}
     }}{_CSS_BASE}
-    /* Grid 网格组 — 包裹连续紧凑题 */
+    /* 双栏表格组 — 包裹连续紧凑题（WeasyPrint 表格布局稳定，替代 CSS Grid） */
     .compact-grid {{
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 6mm;
+        width: 100%;
+        table-layout: fixed;
+        border-collapse: separate;
+        border-spacing: 6mm 0;
         margin-bottom: 4mm;
-        align-items: start;
+        /* 分片约束上移至整行，确保一行两题不会被半途截断跨页 */
+        break-inside: avoid;
+        page-break-inside: avoid;
+    }}
+    .compact-grid tr {{
+        break-inside: avoid;
+        page-break-inside: avoid;
+    }}
+    .compact-grid td {{
+        width: 50%;
+        vertical-align: top;
     }}
     /* 通栏题目 */
     .full-width {{
         width: 100%;
         margin-bottom: 4mm;
-    }}
-    /* 单道题目的容器 — break-inside: avoid 防跨页 */
-    .question-card {{
+        /* 分片约束上移至通栏容器（原在 .question-card 上） */
         break-inside: avoid;
         page-break-inside: avoid;
+    }}
+    /* 单道题目的容器 — 分片约束已上移至外层（表格行 / full-width），此处不再设置 */
+    .question-card {{
         padding: 2mm 3mm;
         border: 1px solid #ddd;
         border-radius: 2mm;
         background: #fafafa;
         /* 用 min-height 确保卡片不会收缩到 0 高度 */
         min-height: 20mm;
+        /* 显式声明，避免任何隐式裁剪导致正文不可见 */
+        overflow: visible;
     }}
     .question-card .q-title {{
         font-weight: bold;
@@ -221,7 +235,9 @@ def generate_html_practice(selected_items, current_time_str, target_folders_str)
         object-fit: contain;
     }}
     @media print {{
-        .question-card {{
+        .compact-grid,
+        .compact-grid tr,
+        .full-width {{
             break-inside: avoid;
             page-break-inside: avoid;
         }}
@@ -241,10 +257,14 @@ def generate_html_practice(selected_items, current_time_str, target_folders_str)
             # 只有1个半栏题时，直接转为通栏，避免右侧全空
             body_parts.append(f'<div class="full-width">{grid_buffer[0]}</div>')
         else:
-            body_parts.append('<div class="compact-grid">')
-            for card in grid_buffer:
-                body_parts.append(card)
-            body_parts.append('</div>')
+            # 表格双栏布局（WeasyPrint 下较 CSS Grid 稳定）：
+            # 每行两列各 50%，两两并排；整行（tr）作为分片单元，避免跨页截断正文
+            body_parts.append('<table class="compact-grid">')
+            for i in range(0, len(grid_buffer), 2):
+                left = grid_buffer[i]
+                right = grid_buffer[i + 1] if i + 1 < len(grid_buffer) else ''
+                body_parts.append(f'<tr><td>{left}</td><td>{right}</td></tr>')
+            body_parts.append('</table>')
         grid_buffer.clear()
 
     idx = 1
