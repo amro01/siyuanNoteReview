@@ -7,7 +7,7 @@
   2. Kramdown 清洗：IAL 剥离、标题识别、块文本/图片提取；
   3. 内容解析：题目 / 答案 / 积分表 / 练习日期；
   4. 分类与标题：基础/易错/困难归类与显示标题生成；
-  5. 版式估算：页数、半栏高度、紧凑题判定；
+  5. 版式估算：页数、紧凑题判定（按图片自然宽度占比）、半栏配对高度；
   6. 选题引擎：初筛 → 分池 → 排序 → 限额入选 → 困难补充。
 
 设计约束：
@@ -456,77 +456,130 @@ def estimate_total_pages(items):
     return max(1, math.ceil(total_lines / lines_per_page))
 
 
-def estimate_compact_height(item):
-    """
-    估算半栏题目在最终渲染时所需的物理高度（像素）。
-    用于对半栏题按高度排序，使高度相近的题目自动配对到同一排，
-    避免因高度差异过大触发跨页防断规则、在页底留下大量空白。
+# ============================================================
+#  紧凑题目判断（按「图片自然宽度占页宽比例」判定）
+# ============================================================
+# 页面几何：renderer 从这里导入，@page margin 与本常量同源。
+A4_WIDTH_MM = 210
+A4_HEIGHT_MM = 297
+PAGE_MARGIN_MM = 10
+PAGE_CONTENT_WIDTH_MM = A4_WIDTH_MM - 2 * PAGE_MARGIN_MM       # 190mm
+GRID_GUTTER_MM = 6                                             # 双栏单元格间距
 
-    计算方式：
-      - 文本行数：按半栏宽度 20 字/行计算
-      - 留白行数：纯文字题按文字行数的 0.8 倍 + 2（至少4行），有图片则不留白
-      - 单行高度：30px（文本 + 留白统一标准）
-      - 图片高度：按半栏宽度 340px 等比缩放
+# 截图采集倍率：错题截图按 2x（HiDPI）采集，一个图像像素 ≈ 0.5 CSS px。
+# 实测本库截图正文墨迹高 ≈23px，对应 16px 字号 @2x，故取 192。
+SCREENSHOT_DPI = 192.0
+
+# 宽度阈值（占 A4 内容区宽度）：≤60% 一律半栏；>65% 才给通栏；60~65% 保守按半栏。
+COMPACT_MAX_WIDTH_RATIO = 0.60
+FULL_WIDTH_MIN_RATIO = 0.65
+# 无图片时的文本行数上限（纯文字题才看行数）
+COMPACT_MAX_TEXT_LINES = 4
+
+_IMAGE_SIZE_CACHE: dict = {}
+
+
+def get_image_size(api_image_path):
+    """
+    返回图片像素尺寸 (w, h)，取不到返回 None。
+
+    结果按资源路径缓存：一次出卷内排版适配会重建 HTML 最多 11 轮，
+    不做缓存则每轮都重新解码同一批 PNG。
+    """
+    if api_image_path in _IMAGE_SIZE_CACHE:
+        return _IMAGE_SIZE_CACHE[api_image_path]
+    size = None
+    if _HAS_PIL:
+        img = _get_pil_image(api_image_path)
+        if img is not None:
+            try:
+                with img:
+                    w_px, h_px = img.size
+                size = (w_px, h_px)
+            except Exception:
+                size = None
+    _IMAGE_SIZE_CACHE[api_image_path] = size
+    return size
+
+
+def image_natural_width_px(api_image_path):
+    """图片在 CSS 中的自然显示宽度（px）：像素宽按 SCREENSHOT_DPI 折算。"""
+    size = get_image_size(api_image_path)
+    if size is None:
+        return None
+    return size[0] * 96.0 / SCREENSHOT_DPI
+
+
+def image_width_ratio(api_image_path):
+    """图片自然宽度占 A4 内容区宽度的比例；取不到尺寸返回 None。"""
+    natural_px = image_natural_width_px(api_image_path)
+    if natural_px is None:
+        return None
+    return (natural_px * 25.4 / 96.0) / PAGE_CONTENT_WIDTH_MM
+
+
+def is_compact_item(item):
+    """
+    判断题目是否放入半栏（可与另一道题并排）。
+
+    规则（宽度优先）：
+      - 有图片：取各图自然宽度占比的最大值；
+                  ≤ COMPACT_MAX_WIDTH_RATIO（60%）→ 半栏（一律，不再看行数）；
+                  > FULL_WIDTH_MIN_RATIO（65%）→ 通栏；
+                  60%~65% 之间 → 半栏（宁可在半栏内微缩，也不放通栏）。
+      - 无图片：非空文本行数 ≤ COMPACT_MAX_TEXT_LINES → 半栏，否则通栏。
+      - 图片尺寸取不到 / Pillow 缺失 → 通栏（保守，避免宽图塞进半栏）。
     """
     text = item[4] if len(item) > 4 else ""
     images = item[5] if len(item) > 5 else []
 
-    h = 0
-    # 1. 计算文本与留白高度
+    if not images:
+        text_lines = len([l for l in text.split("\n") if l.strip()]) if text else 0
+        return text_lines <= COMPACT_MAX_TEXT_LINES
+
+    max_ratio = 0.0
+    for img_path in images:
+        ratio = image_width_ratio(img_path)
+        if ratio is None:
+            return False
+        if ratio > max_ratio:
+            max_ratio = ratio
+    return max_ratio <= FULL_WIDTH_MIN_RATIO
+
+
+def estimate_compact_height(item):
+    """
+    估算题目在半栏容器中的渲染高度（CSS px），用于把高度接近的题目配对到同一行，
+    减少页底留白。
+
+    仅用于配对排序，允许近似：文本按 20 字/行、图片按半栏可用宽度等比缩放。
+    """
+    text = item[4] if len(item) > 4 else ""
+    images = item[5] if len(item) > 5 else []
+
+    half_width_px = (PAGE_CONTENT_WIDTH_MM - GRID_GUTTER_MM) / 2 * 96 / 25.4   # ≈ 348
+    # 卡片内边距 + 标题（12pt 粗体 + 2mm 下边距）
+    h = 8.0 + 26.0
+
     text_lines = 0
     if text:
         text_lines = sum(math.ceil(len(p) / 20) for p in text.split("\n") if p.strip())
+    # 11pt / 1.6 行高 ≈ 23.5px
+    h += text_lines * 23.5
+    if not images:
+        h += max(4, math.ceil(text_lines * 0.8) + 2) * 30
 
-    spacer_lines = 0 if images else max(4, math.ceil(text_lines * 0.8) + 2)
-    h += (text_lines + spacer_lines) * 30
-
-    # 2. 计算图片高度（假设半栏宽度约为 340px）
     for img_path in images:
-        im = _get_pil_image(img_path)
-        if im is None:
-            h += 200
+        size = get_image_size(img_path)
+        if size is None:
+            h += 200.0
             continue
-        try:
-            with im:
-                w, img_h = im.size
-                h += img_h * (340 / w) if w > 0 else 200
-        except Exception:
-            h += 200
+        w_px, h_px = size
+        natural_w = w_px * 96.0 / SCREENSHOT_DPI
+        natural_h = h_px * 96.0 / SCREENSHOT_DPI
+        scale = min(1.0, half_width_px / natural_w) if natural_w > 0 else 1.0
+        h += natural_h * scale + 8.0   # 图片上下 margin 各 4px
     return h
-
-
-# ============================================================
-#  紧凑题目判断
-# ============================================================
-def is_compact_item(item):
-    """
-    判断题目是否为"小型题"（适合并排摆放）。
-    标准：所有图片都是 Type 3 (Ratio < 1.3) 且文本行数 < 5。
-    """
-    text = item[4] if len(item) > 4 else ""
-    images = item[5] if len(item) > 5 else []
-
-    text_lines = len([l for l in text.split("\n") if l.strip()]) if text else 0
-    if text_lines >= 5:
-        return False
-
-    if not _HAS_PIL or not images:
-        return True
-
-    for img_path in images:
-        img = _get_pil_image(img_path)
-        if img is None:
-            continue
-        try:
-            with img:
-                w_px, h_px = img.size
-            ratio = w_px / h_px if h_px > 0 else 1.0
-            if ratio >= 1.7:
-                return False
-        except Exception:
-            continue
-
-    return True
 
 
 # ============================================================

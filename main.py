@@ -2,7 +2,7 @@
 """
 思源笔记 —— 错题拼卷机 · 顶层编排入口（步骤5 收敛）
 
-职责：把「扫描 → 过滤 → 选题 → 重排 → 出卷 → 统计」串成单一流程，
+职责：把「扫描 → 过滤 → 选题 → 出卷 → 统计」串成单一流程，
       自身不承载任何解析 / 网络 / 渲染细节。
 
 依赖方向（严格单向）：
@@ -42,15 +42,13 @@ from parser import (
     shorten_title,
     # 版式估算
     estimate_total_pages,
-    estimate_compact_height,
-    is_compact_item,
     # 选题引擎
     select_questions,
 )
 from renderer import (
     generate_html_practice,
     generate_html_answer,
-    compile_html_to_pdf,
+    compile_with_layout,
 )
 
 
@@ -205,28 +203,26 @@ def main():
         print("\n❌ 没有符合选题条件的题目。")
         return
 
-    # 4) 高度智能配对：对半栏题按估算高度排序，使高度相近的题目自动配对到同一排
-    compact_items = [item for item in selected if is_compact_item(item)]
-    normal_items = [item for item in selected if not is_compact_item(item)]
-    compact_items.sort(key=estimate_compact_height, reverse=True)
-    selected = compact_items + normal_items
-    print(f"📐 重排完成：{len(compact_items)} 道半栏题 + {len(normal_items)} 道通栏题")
-
-    # 5) 生成练习卷 HTML → PDF
+    # 4) 生成练习卷 HTML → PDF
+    #    题目顺序完全保持选题引擎的输出；双栏/通栏与分页适配在 renderer 内完成。
     print(f"\n{'=' * 60}")
     print(f"📦 正在生成练习卷 HTML ({len(selected)} 道大题)……")
-    practice_html = generate_html_practice(selected, current_time_str, target_folders_str)
-
-    print(f"   ⏳ 正在编译练习卷 PDF……")
-    success, msg = compile_html_to_pdf(practice_html, practice_pdf)
+    success, msg = compile_with_layout(
+        lambda state: generate_html_practice(
+            selected, current_time_str, target_folders_str, state
+        ),
+        practice_pdf,
+    )
     print(f"   {msg}")
 
     # 5) 生成答案卷 HTML → PDF
     print(f"\n📦 正在生成答案卷 HTML ({len(selected)} 道)……")
-    answer_html = generate_html_answer(selected, current_time_str, target_folders_str)
-
-    print(f"   ⏳ 正在编译答案卷 PDF……")
-    success2, msg2 = compile_html_to_pdf(answer_html, answer_pdf)
+    success2, msg2 = compile_with_layout(
+        lambda state: generate_html_answer(
+            selected, current_time_str, target_folders_str, state
+        ),
+        answer_pdf,
+    )
     print(f"   {msg2}")
 
     # 6) 统计
