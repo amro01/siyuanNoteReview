@@ -98,6 +98,11 @@
   否则每轮都重新解码同一批 PNG。
 - `.compact-grid` 时代的教训：把 `break-inside: avoid` 放在整张表上，多行双栏表会被当成不可分割整体从而溢页；
   分片单元必须是**行**。
+- **通栏包装块 `.full-width` 禁止再加 `break-inside/page-break-inside: avoid`**（2026-10-21 实测回归）：
+  它与内层 `.question-card` 同时 `avoid` 时，WeasyPrint 69 会把包装块高度算成整页内容高（1046.9px），
+  首张通栏卡即被判为放不下而推到第 2 页，后续每张卡各自独占一页；卷头之后出现整页空白。
+  防断裂只由 `.question-card`（半栏行另由 `.compact-row`）承担，包装块保持普通块级流。
+  对应地，`@media print` 的 avoid 列表里也不能再出现 `.full-width`。
 
 ### 4.3 哨兵位置决定测量口径（最容易写错）
 
@@ -143,6 +148,7 @@
 | 去掉 `get_image_size()` 缓存 | 适配最多 11 轮，每轮重建 HTML 都会重新解码同一批 PNG（本库资产 288 张），出卷无谓变慢 |
 | 去掉 `LayoutError` 兜底（改为允许拆页） | 题目/图片会在页边界被切断，违背“绝不输出被截断 PDF”的目标 |
 | 把 `break-inside: avoid` 放回整张双栏表 | 多行表被当作整体，溢出页面后仍被切开 |
+| 给 `.full-width` 包装块加回 `break-inside: avoid` | WeasyPrint 69 把包装块撑成整页高（1046.9px）：首页只剩卷头，之后每张通栏卡独占一页（7 题从 2 页膨胀到 5 页） |
 
 ---
 
@@ -188,6 +194,7 @@ python main.py
   `image_width_ratio()`、`is_compact_item()`（宽度优先判定）、`estimate_compact_height()`（**仅用于配对排序**，非版面真值）。
 - `renderer.py`：`_CSS_BASE`（含 `body{margin:0}`）、`_html_image_tag()`（只缩不放）、
   `_html_build_question_body(pad_px, end_html)`、`_layout_order()`（唯一顺序来源）、
-  `generate_html_practice()`（inline-block 行 / 连续编号 / `.compact-row` 成员写入 `state.rows`）、
+  `generate_html_practice()`（inline-block 行 / 连续编号 / `.compact-row` 成员写入 `state.rows`；
+  通栏 `.full-width` 包装块**不设** `break-inside: avoid`）、
   `generate_html_answer()`（复用同一顺序与编号）、`_collect_anchor_points()`、`_layout_problems()`、
   `_update_row_pads()`（等高注浆）、`fit_document()`（收缩循环）、`compile_with_layout()`（唯一出口，失败不落盘）。

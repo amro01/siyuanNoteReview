@@ -312,12 +312,14 @@ def generate_html_practice(selected_items, current_time_str, target_folders_str,
     .compact-row > .question-card:last-child {{
         margin-right: 0;
     }}
-    /* 通栏题目 */
+    /* 通栏题目包装块。
+       注意：这里**禁止**加 break-inside / page-break-inside: avoid。
+       WeasyPrint 69 在「外层包装块 + 内层 .question-card 同时 avoid」时，会把
+       包装块高度算成整页内容高（实测 1046.9px），导致第一张通栏卡就放不下、
+       被推到第 2 页，后续每张卡各自独占一页。防断裂只由 .question-card 承担。 */
     .full-width {{
         width: 100%;
         margin-bottom: 4mm;
-        break-inside: avoid;
-        page-break-inside: avoid;
     }}
     /* 单道题目的容器 */
     .question-card {{
@@ -361,8 +363,8 @@ def generate_html_practice(selected_items, current_time_str, target_folders_str,
     .question-card.dense .q-title {{ font-size: 10pt; }}
     .question-card.dense .q-spacer {{ height: 0 !important; }}
     @media print {{
+        /* 通栏包装块不参与 avoid（见上方 .full-width 注释）；仅行与卡片防断裂。 */
         .compact-row,
-        .full-width,
         .question-card {{
             break-inside: avoid;
             page-break-inside: avoid;

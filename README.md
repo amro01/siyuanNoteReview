@@ -83,7 +83,7 @@ cp config.json.example config.json
 | `API_TOKEN` | 从思源设置 → API Token 获取 |
 | `NOTEBOOK_ID` | 目标笔记本 ID |
 | `SIYUAN_DATA_PATH` | 思源 data 目录的**物理路径**，用于读取图片文件 |
-| `TARGET_FOLDERS` | 扫描的目标目录名称列表（支持模糊匹配） |
+| `TARGET_FOLDERS` | 扫描的目标目录名称列表（支持模糊匹配；未匹配时会列出可用范围与相近名称） |
 | `SCORE_THRESHOLD` | 总积分 ≥ 此值时跳过该题（已掌握） |
 | `MIN_PAGES` | 练习卷最少估算页数，不足时从困难池补充 |
 | `MAX_PAGES` | 练习卷最大页数限制，超过此值时停止添加新题（默认 10） |
@@ -208,7 +208,7 @@ python siyuan_client.py
 | `API_TOKEN` | — | 从思源设置 → API Token 获取 |
 | `NOTEBOOK_ID` | — | 目标笔记本 ID，从思源 WebSocket 或文件树获取 |
 | `SIYUAN_DATA_PATH` | — | 思源 data 目录的**物理路径**，用于读取图片文件 |
-| `TARGET_FOLDERS` | `["DS0001"]` | 扫描的目标目录名称列表（支持模糊匹配） |
+| `TARGET_FOLDERS` | `["DS0001"]` | 扫描的目标目录名称列表（支持模糊匹配；未匹配时会列出可用范围与相近名称） |
 | `SCORE_THRESHOLD` | `3` | 总积分 ≥ 此值时跳过该题（已掌握） |
 | `MIN_PAGES` | `2` | 练习卷最少估算页数，不足时从困难池补充 |
 | `MAX_PAGES` | `10` | 练习卷最大页数限制，超过此值时停止添加新题 |
@@ -388,6 +388,12 @@ sudo dnf install google-noto-sans-cjk-fonts wqy-microhei-fonts
 - 确保已安装中文字体（见上方「Linux 字体渲染」章节）
 - 检查 WeasyPrint 安装是否正确
 - 查看终端输出的错误信息
+
+### Q: TARGET_FOLDERS 找不到匹配的目录？
+
+- 程序会打印「当前可用的选题范围」（笔记本名称 + 一级文档标题），并给出最接近的编号/名称
+- `TARGET_FOLDERS` 按「笔记本名称 / 一级文档标题的子串」匹配，不会自动顺延编号
+- 多项目标中只要有一项未匹配，未匹配项会被跳过并提示，其余已匹配项继续扫描
 
 ### Q: 没有选中任何题目？
 

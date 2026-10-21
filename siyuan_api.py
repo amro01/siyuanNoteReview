@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import base64
+import difflib
 import io
 import json
 import os
@@ -383,11 +384,144 @@ def list_dir_entries(dir_path):
     return result.get("data", [])
 
 
+_TARGET_CODE_RE = re.compile(r"^([A-Za-z]+)(\d+)")
+
+
+def _fetch_notebooks():
+    """返回笔记本 dict 列表；响应结构异常时返回空列表。"""
+    nb_result = call_api("/api/notebook/lsNotebooks")
+    if nb_result.get("code") != 0:
+        return []
+    # 思源 /api/notebook/lsNotebooks 的 data 是 {"notebooks": [...], ...}，
+    # 不是列表；直接迭代 data 会拿到 "notebooks"/"boxDocEnabled" 这类字符串键。
+    # 兼容旧版/异常返回为裸列表的情形。
+    nb_data = nb_result.get("data") or {}
+    notebooks = nb_data.get("notebooks") if isinstance(nb_data, dict) else nb_data
+    if not isinstance(notebooks, list):
+        return []
+    return [nb for nb in notebooks if isinstance(nb, dict)]
+
+
+def list_target_candidates():
+    """
+    列出 TARGET_FOLDERS 实际可选中的条目：笔记本名称 + 一级文档（hpath 深度为 1）。
+
+    返回 [{"name", "hpath", "type"}]，type ∈ {"notebook", "doc"}。
+    仅用于“未匹配”时的提示，不做任何写入。
+    """
+    candidates = []
+    seen = set()
+
+    for nb in _fetch_notebooks():
+        name = (nb.get("name") or "").strip()
+        if name and ("notebook", name) not in seen:
+            seen.add(("notebook", name))
+            candidates.append({"name": name, "hpath": f"/{name}", "type": "notebook"})
+
+    sql = ("SELECT id, content, hpath FROM blocks WHERE type='d' "
+           "AND length(hpath) - length(replace(hpath, '/', '')) = 1 "
+           "ORDER BY hpath ASC")
+    result = call_api("/api/query/sql", {"stmt": sql})
+    if result.get("code") == 0:
+        for row in result.get("data") or []:
+            if not isinstance(row, dict):
+                continue
+            hpath = (row.get("hpath") or "").strip()
+            if not hpath:
+                continue
+            name = (row.get("content") or "").strip() or hpath.lstrip("/")
+            if ("doc", hpath) in seen:
+                continue
+            seen.add(("doc", hpath))
+            candidates.append({"name": name, "hpath": hpath, "type": "doc"})
+    else:
+        print(f"  ⚠️  查询一级文档失败: {result.get('msg')}")
+
+    return candidates
+
+
+def explain_unmatched_targets(targets, partial=False):
+    """
+    打印 TARGET_FOLDERS 未匹配项的排查提示。
+
+    targets : 未匹配的配置项列表
+    partial : True 表示同批其它目标已匹配（此时提示“其余目标仍会继续扫描”）
+    """
+    raw = [str(t).strip() for t in targets if t is not None]
+    blank_count = sum(1 for t in raw if not t)
+    targets = [t for t in raw if t]
+    if blank_count:
+        print(f"\n⚠️  TARGET_FOLDERS 中有 {blank_count} 个空白项，已忽略。")
+    if not targets:
+        if not partial:
+            if blank_count:
+                print("   请在 config.json 中填写有效的笔记本名称或一级文档标题。")
+            else:
+                print("\n❌ TARGET_FOLDERS 为空，未指定任何选题范围。")
+                print("   请在 config.json 中至少填写一个笔记本名称或一级文档标题。")
+        return
+
+    if not partial:
+        print(f"\n❌ 未找到匹配的目录/文档: {targets}")
+    else:
+        print(f"\n⚠️  以下目标未匹配，已跳过: {targets}")
+        print("   其余已匹配的目标会继续扫描。")
+
+    candidates = list_target_candidates()
+    if not candidates:
+        print("   未能读取任何候选目录（笔记本列表与一级文档均为空）。")
+        print("   若上方有 API 报错，请先解决连接/权限问题；否则请先在思源中创建笔记本或文档。")
+        return
+
+    names = [c["name"] for c in candidates]
+
+    # 1) 编号相似项：同前缀（DS/JH…）且数字最接近
+    for target in targets:
+        m = _TARGET_CODE_RE.match(target)
+        if not m:
+            continue
+        prefix, num = m.group(1).upper(), int(m.group(2))
+        nearest = []
+        for c in candidates:
+            cm = _TARGET_CODE_RE.match(c["name"])
+            if not cm or cm.group(1).upper() != prefix:
+                continue
+            nearest.append((abs(int(cm.group(2)) - num), c["name"]))
+        nearest.sort()
+        if nearest:
+            shown = ", ".join(name for _, name in nearest[:2])
+            print(f"   💡 「{target}」最接近的现有编号: {shown}")
+
+    # 2) 名称相似项
+    for target in targets:
+        close = difflib.get_close_matches(target, names, n=3, cutoff=0.45)
+        if close:
+            print(f"   💡 「{target}」名称相近的现有条目: {', '.join(close)}")
+
+    # 3) 可用范围清单
+    print("\n   常用选题范围（笔记本 / 一级文档；子文档标题同样可作为匹配条件）：")
+    for c in candidates[:20]:
+        kind = "笔记本" if c["type"] == "notebook" else "文档"
+        print(f"     • [{kind}] {c['name']}  ({c['hpath']})")
+    if len(candidates) > 20:
+        print(f"     … 另有 {len(candidates) - 20} 项未列出")
+
+    print("\n   提示：TARGET_FOLDERS 按「笔记本名称 / 文档标题」的子串匹配，"
+          "不会自动顺延编号；")
+    print("         通常填一级文档标题即可；请改为上面列出的名称之一，"
+          "或先在思源中创建对应文档后重试。")
+    if not partial:
+        print("         修改 config.json 的 TARGET_FOLDERS 后重新运行 main.py 即可。")
+
+
 def find_target_dirs():
     cfg = _cfg()
     matched = []
     for target in cfg.target_folders:
-        target_stripped = target.strip()
+        target_stripped = str(target).strip()
+        # 空串会让 LIKE '%%' 命中全部文档，必须跳过；提示由 main 统一给出。
+        if not target_stripped:
+            continue
 
         # 1) SQL 模糊匹配（全量查询，不限制笔记本）
         sql = (f"SELECT id, hpath, content, box FROM blocks "
@@ -423,27 +557,20 @@ def find_target_dirs():
             print(f"  [ERROR] SQL 查询失败: {result.get('msg')}")
 
         # 2) SQL 没找到 → 尝试匹配笔记本名称（去除前后空格后比较）
-        nb_result = call_api("/api/notebook/lsNotebooks")
-        if nb_result.get("code") == 0:
-            notebooks = nb_result.get("data", [])
-            found_nb = False
-            for nb in notebooks:
-                nb_name = nb.get("name", "").strip()
-                nb_id = nb.get("id", "")
-                if target_stripped in nb_name:
-                    matched.append({
-                        "name": target_stripped,
-                        "id": nb_id,
-                        "hpath": f"/{nb_name}",
-                        "type": "notebook"
-                    })
-                    print(f"   📂 找到目录 {target_stripped} → 匹配笔记本名称: {nb_name} (id: {nb_id})")
-                    found_nb = True
-                    break
-            if not found_nb:
-                print(f"  DEBUG: 尝试匹配关键词 '{target_stripped}' 失败，请检查思源中是否存在该标题的文档。")
-        else:
-            print(f"  DEBUG: 尝试匹配关键词 '{target_stripped}' 失败，请检查思源中是否存在该标题的文档。")
+        #    未匹配项不在这里打印：由 explain_unmatched_targets() 统一给出
+        #    可用范围与相近名称，避免同一句话重复两遍。
+        for nb in _fetch_notebooks():
+            nb_name = (nb.get("name") or "").strip()
+            nb_id = nb.get("id", "")
+            if target_stripped in nb_name:
+                matched.append({
+                    "name": target_stripped,
+                    "id": nb_id,
+                    "hpath": f"/{nb_name}",
+                    "type": "notebook"
+                })
+                print(f"   📂 找到目录 {target_stripped} → 匹配笔记本名称: {nb_name} (id: {nb_id})")
+                break
     return matched
 
 

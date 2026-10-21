@@ -25,6 +25,7 @@ from siyuan_api import (
     resolve_siyuan_base,
     # 思源仓储
     find_target_dirs,
+    explain_unmatched_targets,
     list_sy_files_in_dir,
     get_doc_title,
     get_block_kramdown,
@@ -90,9 +91,15 @@ def collect_documents(cfg):
 
     # 1) 查找目录
     target_dirs = find_target_dirs()
+    matched_names = {d["name"] for d in target_dirs}
+    unmatched = [str(t).strip() for t in cfg.target_folders
+                 if str(t).strip() not in matched_names]
+
+    # 未匹配项统一给出「可用范围 + 相近名称 + 修改方法」的文字提示；
+    # 部分匹配时只提示缺失项，已匹配的目录继续扫描。
+    if unmatched or not target_dirs:
+        explain_unmatched_targets(unmatched, partial=bool(target_dirs))
     if not target_dirs:
-        print(f"\n❌ 未找到匹配的目录: {cfg.target_folders}")
-        print(f"   请确认笔记本名称或其下的文档标题包含: {cfg.target_folders}。")
         return []
 
     print(f"📁 正在针对以下目录扫描：")
@@ -156,6 +163,9 @@ def collect_documents(cfg):
 
     if not all_docs:
         print("\n❌ 未找到任何文档。")
+        print("   可能原因：目标目录下没有子文档（填的是叶子文档而非章节目录），")
+        print("   或全部文档都被 EXCLUDE_RECENT_DAYS 排除了。")
+        print("   请检查 TARGET_FOLDERS，或调小 EXCLUDE_RECENT_DAYS 后重试。")
         return []
 
     return all_docs
